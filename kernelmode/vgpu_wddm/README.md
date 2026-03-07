@@ -8,7 +8,8 @@ It is a transition step from the current System-class render-only `vgpu.sys`.
 Current status:
 - Skeleton only (bring-up stage)
 - Uses KMDOD registration (`DxgkInitializeDisplayOnlyDriver`)
-- Not yet wired to virtio-vgpu queues or real present/scanout path
+- `PresentDisplayOnly` ingests frames into a shadow buffer for bring-up telemetry
+- Not yet wired to virtio-vgpu queues or real host present/scanout path
 
 ## Why this exists
 

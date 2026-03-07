@@ -14,6 +14,8 @@
 #define MVISOR_WDDM_MAX_CHILDREN 1
 #define MVISOR_WDDM_VENDOR_ID 0x1AF4
 #define MVISOR_WDDM_DEVICE_ID 0x105B
+#define MVISOR_WDDM_DEFAULT_HEIGHT 768
+#define MVISOR_WDDM_MAX_SHADOW_BYTES (64 * 1024 * 1024)
 
 #ifndef DXGKDDI_WDDMv1_3
 #define DXGKDDI_WDDMv1_3 DXGKDDI_WDDMv1_2
@@ -27,6 +29,15 @@ typedef struct _MVISOR_WDDM_DEVICE_CONTEXT {
     DXGKRNL_INTERFACE DxgkInterface;
     USHORT VendorId;
     USHORT DeviceId;
+    ULONG Width;
+    ULONG Height;
+    ULONG Pitch;
+    ULONG BytesPerPixel;
+    ULONG64 PresentCount;
+    ULONG64 ScanoutSeq;
+    PVOID ShadowFrameBuffer;
+    SIZE_T ShadowFrameBufferSize;
+    KSPIN_LOCK PresentLock;
     BOOLEAN Started;
 } MVISOR_WDDM_DEVICE_CONTEXT, *PMVISOR_WDDM_DEVICE_CONTEXT;
 
@@ -76,6 +87,121 @@ MvisorWddmCheckHardware(_Inout_ PMVISOR_WDDM_DEVICE_CONTEXT context)
     return STATUS_SUCCESS;
 }
 
+static ULONG
+MvisorWddmEstimateHeight(_In_ CONST DXGKARG_PRESENT_DISPLAYONLY* present)
+{
+    ULONG i;
+    ULONG maxBottom = 0;
+
+    if (present->pDirtyRect != NULL && present->NumDirtyRects > 0) {
+        for (i = 0; i < present->NumDirtyRects; i++) {
+            LONG bottom = present->pDirtyRect[i].bottom;
+            if (bottom > 0 && (ULONG)bottom > maxBottom) {
+                maxBottom = (ULONG)bottom;
+            }
+        }
+    }
+
+    if (maxBottom > 0) {
+        return maxBottom;
+    }
+    return MVISOR_WDDM_DEFAULT_HEIGHT;
+}
+
+static NTSTATUS
+MvisorWddmEnsureShadowBuffer(
+    _Inout_ PMVISOR_WDDM_DEVICE_CONTEXT context,
+    _In_ SIZE_T requiredBytes)
+{
+    KIRQL oldIrql;
+    PVOID newBuffer;
+
+    if (requiredBytes == 0 || requiredBytes > MVISOR_WDDM_MAX_SHADOW_BYTES) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KeAcquireSpinLock(&context->PresentLock, &oldIrql);
+    if (context->ShadowFrameBuffer != NULL && context->ShadowFrameBufferSize >= requiredBytes) {
+        KeReleaseSpinLock(&context->PresentLock, oldIrql);
+        return STATUS_SUCCESS;
+    }
+    KeReleaseSpinLock(&context->PresentLock, oldIrql);
+
+    newBuffer = ExAllocatePoolWithTag(NonPagedPoolNx, requiredBytes, MVISOR_WDDM_TAG);
+    if (newBuffer == NULL) {
+        return STATUS_NO_MEMORY;
+    }
+
+    KeAcquireSpinLock(&context->PresentLock, &oldIrql);
+    if (context->ShadowFrameBuffer != NULL) {
+        ExFreePoolWithTag(context->ShadowFrameBuffer, MVISOR_WDDM_TAG);
+    }
+    context->ShadowFrameBuffer = newBuffer;
+    context->ShadowFrameBufferSize = requiredBytes;
+    KeReleaseSpinLock(&context->PresentLock, oldIrql);
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+MvisorWddmStagePresentFrame(
+    _Inout_ PMVISOR_WDDM_DEVICE_CONTEXT context,
+    _In_ CONST DXGKARG_PRESENT_DISPLAYONLY* present)
+{
+    NTSTATUS status;
+    SIZE_T requiredBytes;
+    ULONG height;
+    ULONG y;
+    PUCHAR src;
+    PUCHAR dst;
+    KIRQL oldIrql;
+
+    if (present->pSource == NULL || present->Pitch == 0 || present->BytesPerPixel == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    height = MvisorWddmEstimateHeight(present);
+    requiredBytes = ((SIZE_T)present->Pitch) * ((SIZE_T)height);
+    status = MvisorWddmEnsureShadowBuffer(context, requiredBytes);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    src = (PUCHAR)present->pSource;
+
+    KeAcquireSpinLock(&context->PresentLock, &oldIrql);
+    dst = (PUCHAR)context->ShadowFrameBuffer;
+    if (dst == NULL || context->ShadowFrameBufferSize < requiredBytes) {
+        KeReleaseSpinLock(&context->PresentLock, oldIrql);
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    for (y = 0; y < height; y++) {
+        RtlCopyMemory(dst + ((SIZE_T)y * present->Pitch),
+                      src + ((SIZE_T)y * present->Pitch),
+                      present->Pitch);
+    }
+
+    context->Pitch = present->Pitch;
+    context->BytesPerPixel = present->BytesPerPixel;
+    context->Height = height;
+    context->Width = present->Pitch / present->BytesPerPixel;
+    context->PresentCount++;
+    context->ScanoutSeq++;
+
+    if ((context->PresentCount % 120) == 0) {
+        MVISOR_WDDM_LOG("present-staged frames=%llu size=%lux%lu pitch=%lu dirty=%u",
+            context->PresentCount,
+            context->Width,
+            context->Height,
+            context->Pitch,
+            present->NumDirtyRects);
+    }
+
+    KeReleaseSpinLock(&context->PresentLock, oldIrql);
+    return STATUS_SUCCESS;
+}
+
 VOID
 MvisorWddmUnload(VOID)
 {
@@ -107,6 +233,7 @@ MvisorWddmAddDevice(
 
     RtlZeroMemory(context, sizeof(*context));
     context->PhysicalDeviceObject = PhysicalDeviceObject;
+    KeInitializeSpinLock(&context->PresentLock);
     context->Started = FALSE;
     *MiniportDeviceContext = context;
 
@@ -122,6 +249,11 @@ MvisorWddmRemoveDevice(_In_ VOID* MiniportDeviceContext)
 
     context = (PMVISOR_WDDM_DEVICE_CONTEXT)MiniportDeviceContext;
     if (context != NULL) {
+        if (context->ShadowFrameBuffer != NULL) {
+            ExFreePoolWithTag(context->ShadowFrameBuffer, MVISOR_WDDM_TAG);
+            context->ShadowFrameBuffer = NULL;
+            context->ShadowFrameBufferSize = 0;
+        }
         ExFreePoolWithTag(context, MVISOR_WDDM_TAG);
     }
 
@@ -178,6 +310,10 @@ MvisorWddmStopDevice(_In_ VOID* MiniportDeviceContext)
 
     context = (PMVISOR_WDDM_DEVICE_CONTEXT)MiniportDeviceContext;
     context->Started = FALSE;
+    context->Width = 0;
+    context->Height = 0;
+    context->Pitch = 0;
+    context->BytesPerPixel = 0;
 
     return STATUS_SUCCESS;
 }
@@ -415,13 +551,15 @@ MvisorWddmPresentDisplayOnly(
         return STATUS_UNSUCCESSFUL;
     }
 
+    if (PresentDisplayOnly->BytesPerPixel < 4) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     /*
-     * TODO: Phase 4+ integration point:
-     * - map VidPnSourceId/source surface into virtio-vgpu resource
-     * - issue host present/scanout update
-     * - signal fence completion path for DWM pacing
+     * Phase-4 step: ingest and stage presents in a shadow buffer with
+     * geometry/dirty-rect tracking. Host scanout transport wiring is next.
      */
-    return STATUS_SUCCESS;
+    return MvisorWddmStagePresentFrame(context, PresentDisplayOnly);
 }
 
 NTSTATUS
