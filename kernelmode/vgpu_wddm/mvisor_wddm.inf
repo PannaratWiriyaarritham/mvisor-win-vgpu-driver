@@ -1,0 +1,51 @@
+;
+; mvisor_wddm.inf
+;
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=Display
+ClassGUID={4d36e968-e325-11ce-bfc1-08002be10318}
+Provider=%ManufacturerName%
+CatalogFile=mvisor_wddm.cat
+DriverVer=
+PnpLockDown=1
+
+[DestinationDirs]
+DefaultDestDir = 12
+MvisorWddm_CopyFiles = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+mvisor_wddm.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName%=Mvisor,NTamd64
+
+[Mvisor.NTamd64]
+%MvisorWddm.DeviceDesc%=MvisorWddm_Install, PCI\VEN_1AF4&DEV_105B&REV_01
+%MvisorWddm.DeviceDesc%=MvisorWddm_Install, PCI\VEN_1AF4&DEV_105B
+
+[MvisorWddm_Install.NT]
+CopyFiles = MvisorWddm_CopyFiles
+
+[MvisorWddm_CopyFiles]
+mvisor_wddm.sys
+
+[MvisorWddm_Install.NT.Services]
+AddService = mvisor_wddm,0x00000002,MvisorWddm_Service_Inst
+
+[MvisorWddm_Service_Inst]
+DisplayName    = %MvisorWddm.SVCDESC%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %12%\mvisor_wddm.sys
+
+[Strings]
+ManufacturerName="Mvisor"
+DiskName="Mvisor WDDM Installation Disk"
+MvisorWddm.DeviceDesc="Mvisor vGPU Display Adapter (WDDM DOD)"
+MvisorWddm.SVCDESC="Mvisor vGPU WDDM Display-Only Miniport"
