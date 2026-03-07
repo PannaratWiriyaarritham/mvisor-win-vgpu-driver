@@ -2,8 +2,8 @@
  * Mvisor vGPU WDDM display-only miniport skeleton.
  *
  * This is a bring-up scaffold for a Display-class driver path (KMDOD).
- * The present path is intentionally a no-op for now; later phases will
- * wire PresentDisplayOnly/SystemDisplayWrite to virtio-vgpu scanout.
+ * PresentDisplayOnly/SystemDisplayWrite currently stage frames into a
+ * guarded shadow framebuffer; later phases will wire host scanout.
  */
 
 #include <ntddk.h>
@@ -114,6 +114,7 @@ MvisorWddmEnsureShadowBuffer(
     _In_ SIZE_T requiredBytes)
 {
     KIRQL oldIrql;
+    PVOID oldBuffer;
     PVOID newBuffer;
 
     if (requiredBytes == 0 || requiredBytes > MVISOR_WDDM_MAX_SHADOW_BYTES) {
@@ -133,13 +134,187 @@ MvisorWddmEnsureShadowBuffer(
     }
 
     KeAcquireSpinLock(&context->PresentLock, &oldIrql);
-    if (context->ShadowFrameBuffer != NULL) {
-        ExFreePoolWithTag(context->ShadowFrameBuffer, MVISOR_WDDM_TAG);
-    }
+    oldBuffer = context->ShadowFrameBuffer;
     context->ShadowFrameBuffer = newBuffer;
     context->ShadowFrameBufferSize = requiredBytes;
     KeReleaseSpinLock(&context->PresentLock, oldIrql);
 
+    if (oldBuffer != NULL) {
+        ExFreePoolWithTag(oldBuffer, MVISOR_WDDM_TAG);
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+MvisorWddmSafeSizeMultiply(
+    _In_ SIZE_T left,
+    _In_ SIZE_T right,
+    _Out_ SIZE_T* result)
+{
+    if (result == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (left != 0 && right > (MAXULONG_PTR / left)) {
+        return STATUS_INTEGER_OVERFLOW;
+    }
+
+    *result = left * right;
+    return STATUS_SUCCESS;
+}
+
+static ULONG
+MvisorWddmClampRectCoord(_In_ LONG value, _In_ ULONG maxExclusive)
+{
+    if (value <= 0) {
+        return 0;
+    }
+
+    if ((ULONG)value >= maxExclusive) {
+        return maxExclusive;
+    }
+
+    return (ULONG)value;
+}
+
+static VOID
+MvisorWddmUpdateFrameStats(
+    _Inout_ PMVISOR_WDDM_DEVICE_CONTEXT context,
+    _In_ ULONG width,
+    _In_ ULONG height,
+    _In_ ULONG pitch,
+    _In_ ULONG bytesPerPixel)
+{
+    context->Pitch = pitch;
+    context->BytesPerPixel = bytesPerPixel;
+    context->Height = height;
+    context->Width = width;
+    context->PresentCount++;
+    context->ScanoutSeq++;
+}
+
+static NTSTATUS
+MvisorWddmCopyFullFrame(
+    _In_ CONST DXGKARG_PRESENT_DISPLAYONLY* present,
+    _In_ ULONG height,
+    _In_ PUCHAR src,
+    _Inout_ PUCHAR dst)
+{
+    ULONG y;
+
+    for (y = 0; y < height; y++) {
+        SIZE_T rowOffset;
+        NTSTATUS status = MvisorWddmSafeSizeMultiply((SIZE_T)y, (SIZE_T)present->Pitch, &rowOffset);
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+        RtlCopyMemory(dst + rowOffset, src + rowOffset, present->Pitch);
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static BOOLEAN
+MvisorWddmTryCopyDirtyRect(
+    _In_ CONST DXGKARG_PRESENT_DISPLAYONLY* present,
+    _In_ ULONG width,
+    _In_ ULONG height,
+    _In_ PUCHAR src,
+    _Inout_ PUCHAR dst,
+    _In_ CONST RECT* rect)
+{
+    ULONG left;
+    ULONG right;
+    ULONG top;
+    ULONG bottom;
+    SIZE_T leftOffset;
+    SIZE_T rowBytes;
+    ULONG y;
+
+    if (rect == NULL) {
+        return FALSE;
+    }
+
+    left = MvisorWddmClampRectCoord(rect->left, width);
+    right = MvisorWddmClampRectCoord(rect->right, width);
+    top = MvisorWddmClampRectCoord(rect->top, height);
+    bottom = MvisorWddmClampRectCoord(rect->bottom, height);
+
+    if (right <= left || bottom <= top) {
+        return FALSE;
+    }
+
+    if (!NT_SUCCESS(MvisorWddmSafeSizeMultiply((SIZE_T)left, (SIZE_T)present->BytesPerPixel, &leftOffset))) {
+        return FALSE;
+    }
+    if (!NT_SUCCESS(MvisorWddmSafeSizeMultiply((SIZE_T)(right - left), (SIZE_T)present->BytesPerPixel, &rowBytes))) {
+        return FALSE;
+    }
+
+    for (y = top; y < bottom; y++) {
+        SIZE_T rowOffset;
+        if (!NT_SUCCESS(MvisorWddmSafeSizeMultiply((SIZE_T)y, (SIZE_T)present->Pitch, &rowOffset))) {
+            return FALSE;
+        }
+        RtlCopyMemory(dst + rowOffset + leftOffset, src + rowOffset + leftOffset, rowBytes);
+    }
+
+    return TRUE;
+}
+
+static NTSTATUS
+MvisorWddmStageSystemDisplayFrame(
+    _Inout_ PMVISOR_WDDM_DEVICE_CONTEXT context,
+    _In_ CONST VOID* source,
+    _In_ UINT sourceWidth,
+    _In_ UINT sourceHeight,
+    _In_ UINT sourceStride)
+{
+    NTSTATUS status;
+    SIZE_T requiredBytes;
+    UINT y;
+    CONST PUCHAR src;
+    PUCHAR dst;
+    KIRQL oldIrql;
+
+    if (source == NULL || sourceWidth == 0 || sourceHeight == 0 || sourceStride == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    status = MvisorWddmSafeSizeMultiply((SIZE_T)sourceStride, (SIZE_T)sourceHeight, &requiredBytes);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    if (requiredBytes == 0 || requiredBytes > MVISOR_WDDM_MAX_SHADOW_BYTES) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    status = MvisorWddmEnsureShadowBuffer(context, requiredBytes);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    src = (CONST PUCHAR)source;
+    KeAcquireSpinLock(&context->PresentLock, &oldIrql);
+    dst = (PUCHAR)context->ShadowFrameBuffer;
+    if (dst == NULL || context->ShadowFrameBufferSize < requiredBytes) {
+        KeReleaseSpinLock(&context->PresentLock, oldIrql);
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    for (y = 0; y < sourceHeight; y++) {
+        SIZE_T rowOffset;
+        status = MvisorWddmSafeSizeMultiply((SIZE_T)y, (SIZE_T)sourceStride, &rowOffset);
+        if (!NT_SUCCESS(status)) {
+            KeReleaseSpinLock(&context->PresentLock, oldIrql);
+            return status;
+        }
+        RtlCopyMemory(dst + rowOffset, src + rowOffset, sourceStride);
+    }
+
+    MvisorWddmUpdateFrameStats(context, sourceWidth, sourceHeight, sourceStride, 4);
+    KeReleaseSpinLock(&context->PresentLock, oldIrql);
     return STATUS_SUCCESS;
 }
 
@@ -150,8 +325,10 @@ MvisorWddmStagePresentFrame(
 {
     NTSTATUS status;
     SIZE_T requiredBytes;
+    ULONG width;
     ULONG height;
-    ULONG y;
+    ULONG i;
+    ULONG dirtyCopied;
     PUCHAR src;
     PUCHAR dst;
     KIRQL oldIrql;
@@ -159,9 +336,24 @@ MvisorWddmStagePresentFrame(
     if (present->pSource == NULL || present->Pitch == 0 || present->BytesPerPixel == 0) {
         return STATUS_INVALID_PARAMETER;
     }
+    if ((present->Pitch % present->BytesPerPixel) != 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    width = present->Pitch / present->BytesPerPixel;
+    if (width == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     height = MvisorWddmEstimateHeight(present);
-    requiredBytes = ((SIZE_T)present->Pitch) * ((SIZE_T)height);
+    status = MvisorWddmSafeSizeMultiply((SIZE_T)present->Pitch, (SIZE_T)height, &requiredBytes);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    if (requiredBytes == 0 || requiredBytes > MVISOR_WDDM_MAX_SHADOW_BYTES) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     status = MvisorWddmEnsureShadowBuffer(context, requiredBytes);
     if (!NT_SUCCESS(status)) {
         return status;
@@ -176,25 +368,38 @@ MvisorWddmStagePresentFrame(
         return STATUS_UNSUCCESSFUL;
     }
 
-    for (y = 0; y < height; y++) {
-        RtlCopyMemory(dst + ((SIZE_T)y * present->Pitch),
-                      src + ((SIZE_T)y * present->Pitch),
-                      present->Pitch);
+    dirtyCopied = 0;
+    if (present->pDirtyRect != NULL && present->NumDirtyRects > 0) {
+        for (i = 0; i < present->NumDirtyRects; i++) {
+            if (MvisorWddmTryCopyDirtyRect(
+                    present,
+                    width,
+                    height,
+                    src,
+                    dst,
+                    &present->pDirtyRect[i])) {
+                dirtyCopied++;
+            }
+        }
     }
 
-    context->Pitch = present->Pitch;
-    context->BytesPerPixel = present->BytesPerPixel;
-    context->Height = height;
-    context->Width = present->Pitch / present->BytesPerPixel;
-    context->PresentCount++;
-    context->ScanoutSeq++;
+    if (dirtyCopied == 0) {
+        status = MvisorWddmCopyFullFrame(present, height, src, dst);
+        if (!NT_SUCCESS(status)) {
+            KeReleaseSpinLock(&context->PresentLock, oldIrql);
+            return status;
+        }
+    }
+
+    MvisorWddmUpdateFrameStats(context, width, height, present->Pitch, present->BytesPerPixel);
 
     if ((context->PresentCount % 120) == 0) {
-        MVISOR_WDDM_LOG("present-staged frames=%llu size=%lux%lu pitch=%lu dirty=%u",
+        MVISOR_WDDM_LOG("present-staged frames=%llu size=%lux%lu pitch=%lu dirty=%lu/%u",
             context->PresentCount,
             context->Width,
             context->Height,
             context->Pitch,
+            dirtyCopied,
             present->NumDirtyRects);
     }
 
@@ -354,8 +559,6 @@ MvisorWddmQueryChildRelations(
     _Out_writes_bytes_(ChildRelationsSize) DXGK_CHILD_DESCRIPTOR* ChildRelations,
     _In_ ULONG ChildRelationsSize)
 {
-    ULONG childCount;
-
     UNREFERENCED_PARAMETER(MiniportDeviceContext);
     PAGED_CODE();
 
@@ -364,23 +567,13 @@ MvisorWddmQueryChildRelations(
     }
 
     RtlZeroMemory(ChildRelations, ChildRelationsSize);
-
-    childCount = (ChildRelationsSize / sizeof(DXGK_CHILD_DESCRIPTOR));
-    if (childCount > 1) {
-        childCount -= 1;
-    } else {
-        childCount = 0;
-    }
-
-    if (childCount > 0) {
-        ChildRelations[0].ChildDeviceType = TypeVideoOutput;
-        ChildRelations[0].ChildCapabilities.HpdAwareness = HpdAwarenessInterruptible;
-        ChildRelations[0].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = D3DKMDT_VOT_OTHER;
-        ChildRelations[0].ChildCapabilities.Type.VideoOutput.MonitorOrientationAwareness = D3DKMDT_MOA_NONE;
-        ChildRelations[0].ChildCapabilities.Type.VideoOutput.SupportsSdtvModes = FALSE;
-        ChildRelations[0].AcpiUid = 0;
-        ChildRelations[0].ChildUid = 0;
-    }
+    ChildRelations[0].ChildDeviceType = TypeVideoOutput;
+    ChildRelations[0].ChildCapabilities.HpdAwareness = HpdAwarenessInterruptible;
+    ChildRelations[0].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = D3DKMDT_VOT_OTHER;
+    ChildRelations[0].ChildCapabilities.Type.VideoOutput.MonitorOrientationAwareness = D3DKMDT_MOA_NONE;
+    ChildRelations[0].ChildCapabilities.Type.VideoOutput.SupportsSdtvModes = FALSE;
+    ChildRelations[0].AcpiUid = 0;
+    ChildRelations[0].ChildUid = 0;
 
     return STATUS_SUCCESS;
 }
@@ -730,13 +923,26 @@ MvisorWddmSystemDisplayWrite(
     _In_ UINT PositionX,
     _In_ UINT PositionY)
 {
-    UNREFERENCED_PARAMETER(MiniportDeviceContext);
-    UNREFERENCED_PARAMETER(Source);
-    UNREFERENCED_PARAMETER(SourceWidth);
-    UNREFERENCED_PARAMETER(SourceHeight);
-    UNREFERENCED_PARAMETER(SourceStride);
+    PMVISOR_WDDM_DEVICE_CONTEXT context;
+    NTSTATUS status;
+
     UNREFERENCED_PARAMETER(PositionX);
     UNREFERENCED_PARAMETER(PositionY);
+
+    if (MiniportDeviceContext == NULL || Source == NULL) {
+        return;
+    }
+
+    context = (PMVISOR_WDDM_DEVICE_CONTEXT)MiniportDeviceContext;
+    status = MvisorWddmStageSystemDisplayFrame(
+        context,
+        Source,
+        SourceWidth,
+        SourceHeight,
+        SourceStride);
+    if (!NT_SUCCESS(status)) {
+        MVISOR_WDDM_LOG("SystemDisplayWrite stage failed status=0x%08x", status);
+    }
 }
 
 NTSTATUS

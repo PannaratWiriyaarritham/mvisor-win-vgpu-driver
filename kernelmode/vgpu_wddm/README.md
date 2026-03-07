@@ -8,7 +8,8 @@ It is a transition step from the current System-class render-only `vgpu.sys`.
 Current status:
 - Skeleton only (bring-up stage)
 - Uses KMDOD registration (`DxgkInitializeDisplayOnlyDriver`)
-- `PresentDisplayOnly` ingests frames into a shadow buffer for bring-up telemetry
+- `PresentDisplayOnly` stages full/dirty-rect updates into a guarded shadow buffer
+- `SystemDisplayWrite` also stages boot/crash-path frames into the same shadow buffer
 - Not yet wired to virtio-vgpu queues or real host present/scanout path
 
 ## Why this exists
@@ -50,6 +51,6 @@ Expected output artifacts (under project `x64\Release\` intermediate/output path
 ## Next Integration Tasks
 
 1. Implement real adapter capability reporting in `DxgkDdiQueryAdapterInfo`.
-2. Replace no-op `DxgkDdiPresentDisplayOnly` with virtio-vgpu present transport.
+2. Replace shadow-only staging in `DxgkDdiPresentDisplayOnly` with virtio-vgpu present transport.
 3. Connect mode-setting callbacks (`CommitVidPn`, `SetVidPnSourceVisibility`) to host scanout protocol.
 4. Add interrupt/fence synchronization for DWM-friendly present timing.
