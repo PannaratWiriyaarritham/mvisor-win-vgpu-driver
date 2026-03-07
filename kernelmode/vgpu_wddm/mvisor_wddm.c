@@ -274,7 +274,7 @@ MvisorWddmStageSystemDisplayFrame(
     NTSTATUS status;
     SIZE_T requiredBytes;
     UINT y;
-    CONST PUCHAR src;
+    CONST PUCHAR src = (CONST PUCHAR)source;
     PUCHAR dst;
     KIRQL oldIrql;
 
@@ -295,7 +295,6 @@ MvisorWddmStageSystemDisplayFrame(
         return status;
     }
 
-    src = (CONST PUCHAR)source;
     KeAcquireSpinLock(&context->PresentLock, &oldIrql);
     dst = (PUCHAR)context->ShadowFrameBuffer;
     if (dst == NULL || context->ShadowFrameBufferSize < requiredBytes) {
