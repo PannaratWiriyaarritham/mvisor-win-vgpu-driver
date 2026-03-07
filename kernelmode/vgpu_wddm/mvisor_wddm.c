@@ -16,6 +16,11 @@
 #define MVISOR_WDDM_DEVICE_ID 0x105B
 #define MVISOR_WDDM_DEFAULT_HEIGHT 768
 #define MVISOR_WDDM_MAX_SHADOW_BYTES (64 * 1024 * 1024)
+#define MVISOR_WDDM_BRIDGE_SCANOUT_ID 0
+#define MVISOR_WDDM_BRIDGE_RESOURCE_ID 1
+#define MVISOR_WDDM_BRIDGE_LOG_INTERVAL 120
+#define MVISOR_WDDM_VIRTIO_GPU_CMD_SET_SCANOUT 0x0103
+#define MVISOR_WDDM_VIRTIO_GPU_CMD_RESOURCE_FLUSH 0x0104
 
 #ifndef DXGKDDI_WDDMv1_3
 #define DXGKDDI_WDDMv1_3 DXGKDDI_WDDMv1_2
@@ -23,6 +28,26 @@
 
 #define MVISOR_WDDM_LOG(fmt, ...) \
     DbgPrintEx(DPFLTR_IHVVIDEO_ID, DPFLTR_INFO_LEVEL, "mvisor_wddm: " fmt "\n", __VA_ARGS__)
+
+typedef struct _MVISOR_WDDM_BRIDGE_RECT {
+    ULONG X;
+    ULONG Y;
+    ULONG Width;
+    ULONG Height;
+} MVISOR_WDDM_BRIDGE_RECT, *PMVISOR_WDDM_BRIDGE_RECT;
+
+typedef struct _MVISOR_WDDM_BRIDGE_SET_SCANOUT_CMD {
+    ULONG Type;
+    ULONG ScanoutId;
+    ULONG ResourceId;
+    MVISOR_WDDM_BRIDGE_RECT Rect;
+} MVISOR_WDDM_BRIDGE_SET_SCANOUT_CMD, *PMVISOR_WDDM_BRIDGE_SET_SCANOUT_CMD;
+
+typedef struct _MVISOR_WDDM_BRIDGE_RESOURCE_FLUSH_CMD {
+    ULONG Type;
+    ULONG ResourceId;
+    MVISOR_WDDM_BRIDGE_RECT Rect;
+} MVISOR_WDDM_BRIDGE_RESOURCE_FLUSH_CMD, *PMVISOR_WDDM_BRIDGE_RESOURCE_FLUSH_CMD;
 
 typedef struct _MVISOR_WDDM_DEVICE_CONTEXT {
     DEVICE_OBJECT* PhysicalDeviceObject;
@@ -35,6 +60,12 @@ typedef struct _MVISOR_WDDM_DEVICE_CONTEXT {
     ULONG BytesPerPixel;
     ULONG64 PresentCount;
     ULONG64 ScanoutSeq;
+    ULONG BridgeResourceId;
+    ULONG BridgeScanoutWidth;
+    ULONG BridgeScanoutHeight;
+    ULONG64 BridgeSetScanoutCount;
+    ULONG64 BridgeFlushCount;
+    ULONG64 BridgeDropCount;
     PVOID ShadowFrameBuffer;
     SIZE_T ShadowFrameBufferSize;
     KSPIN_LOCK PresentLock;
@@ -194,6 +225,74 @@ MvisorWddmUpdateFrameStats(
     context->ScanoutSeq++;
 }
 
+static VOID
+MvisorWddmBuildBridgeRect(
+    _In_ ULONG width,
+    _In_ ULONG height,
+    _Out_ PMVISOR_WDDM_BRIDGE_RECT rect)
+{
+    rect->X = 0;
+    rect->Y = 0;
+    rect->Width = width;
+    rect->Height = height;
+}
+
+/*
+ * Bridge stubs are called while PresentLock is held.
+ * They model SET_SCANOUT/RESOURCE_FLUSH envelopes for telemetry only.
+ */
+static VOID
+MvisorWddmSubmitBridgePresentLocked(
+    _Inout_ PMVISOR_WDDM_DEVICE_CONTEXT context,
+    _In_ ULONG width,
+    _In_ ULONG height)
+{
+    MVISOR_WDDM_BRIDGE_SET_SCANOUT_CMD setScanoutCmd;
+    MVISOR_WDDM_BRIDGE_RESOURCE_FLUSH_CMD flushCmd;
+
+    if (width == 0 || height == 0) {
+        context->BridgeDropCount++;
+        return;
+    }
+
+    if (context->BridgeScanoutWidth != width || context->BridgeScanoutHeight != height) {
+        RtlZeroMemory(&setScanoutCmd, sizeof(setScanoutCmd));
+        setScanoutCmd.Type = MVISOR_WDDM_VIRTIO_GPU_CMD_SET_SCANOUT;
+        setScanoutCmd.ScanoutId = MVISOR_WDDM_BRIDGE_SCANOUT_ID;
+        setScanoutCmd.ResourceId = context->BridgeResourceId;
+        MvisorWddmBuildBridgeRect(width, height, &setScanoutCmd.Rect);
+
+        context->BridgeScanoutWidth = width;
+        context->BridgeScanoutHeight = height;
+        context->BridgeSetScanoutCount++;
+
+        MVISOR_WDDM_LOG(
+            "bridge-stub set_scanout type=0x%lx scanout=%lu resource=%lu rect=%lux%lu",
+            setScanoutCmd.Type,
+            setScanoutCmd.ScanoutId,
+            setScanoutCmd.ResourceId,
+            setScanoutCmd.Rect.Width,
+            setScanoutCmd.Rect.Height);
+    }
+
+    RtlZeroMemory(&flushCmd, sizeof(flushCmd));
+    flushCmd.Type = MVISOR_WDDM_VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+    flushCmd.ResourceId = context->BridgeResourceId;
+    MvisorWddmBuildBridgeRect(width, height, &flushCmd.Rect);
+    context->BridgeFlushCount++;
+
+    if ((context->BridgeFlushCount % MVISOR_WDDM_BRIDGE_LOG_INTERVAL) == 0) {
+        MVISOR_WDDM_LOG(
+            "bridge-stub flush type=0x%lx resource=%lu rect=%lux%lu count=%llu drops=%llu",
+            flushCmd.Type,
+            flushCmd.ResourceId,
+            flushCmd.Rect.Width,
+            flushCmd.Rect.Height,
+            context->BridgeFlushCount,
+            context->BridgeDropCount);
+    }
+}
+
 static NTSTATUS
 MvisorWddmCopyFullFrame(
     _In_ CONST DXGKARG_PRESENT_DISPLAYONLY* present,
@@ -313,6 +412,7 @@ MvisorWddmStageSystemDisplayFrame(
     }
 
     MvisorWddmUpdateFrameStats(context, sourceWidth, sourceHeight, sourceStride, 4);
+    MvisorWddmSubmitBridgePresentLocked(context, sourceWidth, sourceHeight);
     KeReleaseSpinLock(&context->PresentLock, oldIrql);
     return STATUS_SUCCESS;
 }
@@ -391,6 +491,7 @@ MvisorWddmStagePresentFrame(
     }
 
     MvisorWddmUpdateFrameStats(context, width, height, present->Pitch, present->BytesPerPixel);
+    MvisorWddmSubmitBridgePresentLocked(context, width, height);
 
     if ((context->PresentCount % 120) == 0) {
         MVISOR_WDDM_LOG("present-staged frames=%llu size=%lux%lu pitch=%lu dirty=%lu/%u",
@@ -437,6 +538,7 @@ MvisorWddmAddDevice(
 
     RtlZeroMemory(context, sizeof(*context));
     context->PhysicalDeviceObject = PhysicalDeviceObject;
+    context->BridgeResourceId = MVISOR_WDDM_BRIDGE_RESOURCE_ID;
     KeInitializeSpinLock(&context->PresentLock);
     context->Started = FALSE;
     *MiniportDeviceContext = context;
