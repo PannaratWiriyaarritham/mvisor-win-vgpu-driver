@@ -1,5 +1,6 @@
 ;
 ; mvisor_wddm.inf
+; BuildTimestamp=2026-03-08T04:57:36+07:00
 ;
 
 [Version]
@@ -8,7 +9,7 @@ Class=Display
 ClassGUID={4d36e968-e325-11ce-bfc1-08002be10318}
 Provider=%ManufacturerName%
 CatalogFile=mvisor_wddm.cat
-DriverVer=03/08/2026,4.50.46.29
+DriverVer=03/08/2026,4.50.46.30
 PnpLockDown=1
 
 [DestinationDirs]
