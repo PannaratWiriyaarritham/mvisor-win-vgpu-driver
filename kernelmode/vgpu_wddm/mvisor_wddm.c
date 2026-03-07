@@ -12,6 +12,8 @@
 #define MVISOR_WDDM_TAG 'WvMM'
 #define MVISOR_WDDM_MAX_VIEWS 1
 #define MVISOR_WDDM_MAX_CHILDREN 1
+#define MVISOR_WDDM_VENDOR_ID 0x1AF4
+#define MVISOR_WDDM_DEVICE_ID 0x105B
 
 #ifndef DXGKDDI_WDDMv1_3
 #define DXGKDDI_WDDMv1_3 DXGKDDI_WDDMv1_2
@@ -23,6 +25,8 @@
 typedef struct _MVISOR_WDDM_DEVICE_CONTEXT {
     DEVICE_OBJECT* PhysicalDeviceObject;
     DXGKRNL_INTERFACE DxgkInterface;
+    USHORT VendorId;
+    USHORT DeviceId;
     BOOLEAN Started;
 } MVISOR_WDDM_DEVICE_CONTEXT, *PMVISOR_WDDM_DEVICE_CONTEXT;
 
@@ -30,6 +34,46 @@ static PMVISOR_WDDM_DEVICE_CONTEXT
 MvisorWddmContextFromAdapterHandle(_In_ CONST HANDLE hAdapter)
 {
     return (PMVISOR_WDDM_DEVICE_CONTEXT)hAdapter;
+}
+
+static NTSTATUS
+MvisorWddmCheckHardware(_Inout_ PMVISOR_WDDM_DEVICE_CONTEXT context)
+{
+    NTSTATUS status;
+    ULONG bytesRead;
+    ULONG configId;
+
+    /*
+     * PCI config offset 0x00 layout:
+     * bits  0..15: Vendor ID
+     * bits 16..31: Device ID
+     */
+    status = context->DxgkInterface.DxgkCbReadDeviceSpace(
+        context->DxgkInterface.DeviceHandle,
+        DXGK_WHICHSPACE_CONFIG,
+        &configId,
+        0,
+        sizeof(configId),
+        &bytesRead);
+    if (!NT_SUCCESS(status)) {
+        MVISOR_WDDM_LOG("DxgkCbReadDeviceSpace failed status=0x%08x", status);
+        return status;
+    }
+    if (bytesRead < sizeof(configId)) {
+        MVISOR_WDDM_LOG("DxgkCbReadDeviceSpace short read bytes=%lu", bytesRead);
+        return STATUS_DEVICE_HARDWARE_ERROR;
+    }
+
+    context->VendorId = (USHORT)(configId & 0xFFFF);
+    context->DeviceId = (USHORT)((configId >> 16) & 0xFFFF);
+
+    MVISOR_WDDM_LOG("PCI id vendor=0x%04x device=0x%04x", context->VendorId, context->DeviceId);
+
+    if (context->VendorId != MVISOR_WDDM_VENDOR_ID || context->DeviceId != MVISOR_WDDM_DEVICE_ID) {
+        return STATUS_GRAPHICS_DRIVER_MISMATCH;
+    }
+
+    return STATUS_SUCCESS;
 }
 
 VOID
@@ -92,6 +136,7 @@ MvisorWddmStartDevice(
     _Out_ ULONG* NumberOfViews,
     _Out_ ULONG* NumberOfChildren)
 {
+    NTSTATUS status;
     PMVISOR_WDDM_DEVICE_CONTEXT context;
 
     UNREFERENCED_PARAMETER(DxgkStartInfo);
@@ -104,6 +149,12 @@ MvisorWddmStartDevice(
 
     context = (PMVISOR_WDDM_DEVICE_CONTEXT)MiniportDeviceContext;
     RtlCopyMemory(&context->DxgkInterface, DxgkInterface, sizeof(*DxgkInterface));
+
+    status = MvisorWddmCheckHardware(context);
+    if (!NT_SUCCESS(status)) {
+        MVISOR_WDDM_LOG("hardware check failed status=0x%08x", status);
+        return status;
+    }
 
     *NumberOfViews = MVISOR_WDDM_MAX_VIEWS;
     *NumberOfChildren = MVISOR_WDDM_MAX_CHILDREN;
