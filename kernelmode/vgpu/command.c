@@ -251,6 +251,45 @@ VOID TransferHost3D(PDEVICE_CONTEXT Context, ULONG32 VirglContextId, PVIRTGPU_TR
     PushQueue(Context, COMMAND_QUEUE, sg, outNum, 0, buffer, NULL, 0);
 }
 
+VOID SetScanout(PDEVICE_CONTEXT Context, PVIRTGPU_SET_SCANOUT_PARAM SetScanoutParam)
+{
+    struct VirtIOBufferDescriptor sg[SGLIST_SIZE];
+    UINT32 outNum;
+
+    PVGPU_BUFFER buffer = AllocateCommandBuffer(Context, sizeof(struct virtio_gpu_set_scanout), 0, FALSE, NULL);
+    struct virtio_gpu_set_scanout* cmd = buffer->pBuf;
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
+    cmd->scanout_id = SetScanoutParam->scanout_id;
+    cmd->resource_id = SetScanoutParam->resource_id;
+    cmd->r.x = SetScanoutParam->r.x;
+    cmd->r.y = SetScanoutParam->r.y;
+    cmd->r.width = SetScanoutParam->r.width;
+    cmd->r.height = SetScanoutParam->r.height;
+
+    outNum = BuildSGElement(&sg[0], SGLIST_SIZE, (PUINT8)cmd, sizeof(*cmd));
+    PushQueue(Context, COMMAND_QUEUE, sg, outNum, 0, buffer, NULL, 0);
+}
+
+VOID ResourceFlush(PDEVICE_CONTEXT Context, PVIRTGPU_RESOURCE_FLUSH_PARAM FlushParam)
+{
+    struct VirtIOBufferDescriptor sg[SGLIST_SIZE];
+    UINT32 outNum;
+
+    PVGPU_BUFFER buffer = AllocateCommandBuffer(Context, sizeof(struct virtio_gpu_resource_flush), 0, FALSE, NULL);
+    struct virtio_gpu_resource_flush* cmd = buffer->pBuf;
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+    cmd->resource_id = FlushParam->resource_id;
+    cmd->r.x = FlushParam->r.x;
+    cmd->r.y = FlushParam->r.y;
+    cmd->r.width = FlushParam->r.width;
+    cmd->r.height = FlushParam->r.height;
+
+    outNum = BuildSGElement(&sg[0], SGLIST_SIZE, (PUINT8)cmd, sizeof(*cmd));
+    PushQueue(Context, COMMAND_QUEUE, sg, outNum, 0, buffer, NULL, 0);
+}
+
 VOID Create2DResource(PDEVICE_CONTEXT Context, ULONG32 VirglContextId, ULONG32 ResourceId, PVIRTGPU_RESOURCE_CREATE_PARAM Create, ULONG64 FenceId)
 {
     struct VirtIOBufferDescriptor sg[SGLIST_SIZE];

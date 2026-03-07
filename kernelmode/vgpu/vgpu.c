@@ -121,6 +121,8 @@ VOID VirtioVgpuReadFromQueue(PDEVICE_CONTEXT Context, struct virtqueue* pVirtQue
         case VIRTIO_GPU_CMD_RESOURCE_CREATE_2D:
         case VIRTIO_GPU_CMD_RESOURCE_CREATE_3D:
         case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB:
+        case VIRTIO_GPU_CMD_SET_SCANOUT:
+        case VIRTIO_GPU_CMD_RESOURCE_FLUSH:
         case VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB:
         case VIRTIO_GPU_CMD_RESOURCE_UNREF:
         case VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING:
@@ -311,6 +313,12 @@ VOID VirtioVgpuIoControl(IN WDFQUEUE Queue, IN WDFREQUEST Request, IN size_t Out
         break;
     case IOCTL_VIRTIO_VGPU_BLOB_RESOURCE_CREATE:
         status = CtlCreateBlobResource(Request, OutputBufferLength, InputBufferLength, &bytesReturn);
+        break;
+    case IOCTL_VIRTIO_VGPU_SET_SCANOUT:
+        status = CtlSetScanout(GetDeviceContext(WdfIoQueueGetDevice(Queue)), Request, InputBufferLength, &bytesReturn);
+        break;
+    case IOCTL_VIRTIO_VGPU_RESOURCE_FLUSH:
+        status = CtlResourceFlush(GetDeviceContext(WdfIoQueueGetDevice(Queue)), Request, InputBufferLength, &bytesReturn);
         break;
     default:
         status = STATUS_NOT_SUPPORTED;

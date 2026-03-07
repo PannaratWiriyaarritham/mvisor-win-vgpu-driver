@@ -221,6 +221,22 @@ struct virtio_gpu_transfer_to_host_2d {
     __le32 padding;
 };
 
+/* VIRTIO_GPU_CMD_SET_SCANOUT */
+struct virtio_gpu_set_scanout {
+    struct virtio_gpu_ctrl_hdr hdr;
+    struct virtio_gpu_rect r;
+    __le32 scanout_id;
+    __le32 resource_id;
+};
+
+/* VIRTIO_GPU_CMD_RESOURCE_FLUSH */
+struct virtio_gpu_resource_flush {
+    struct virtio_gpu_ctrl_hdr hdr;
+    struct virtio_gpu_rect r;
+    __le32 resource_id;
+    __le32 padding;
+};
+
 /* VIRTIO_GPU_CMD_SUBMIT_3D */
 struct virtio_gpu_cmd_submit {
     struct virtio_gpu_ctrl_hdr hdr;
@@ -329,6 +345,17 @@ typedef struct _VIRTGPU_TRANSFER_HOST_2D_PARAM {
     __le32 resource_id;
 }VIRTGPU_TRANSFER_HOST_2D_PARAM, * PVIRTGPU_TRANSFER_HOST_2D_PARAM;
 
+typedef struct _VIRTGPU_SET_SCANOUT_PARAM {
+    __u32 scanout_id;
+    __u32 resource_id;
+    struct virtio_gpu_rect r;
+}VIRTGPU_SET_SCANOUT_PARAM, * PVIRTGPU_SET_SCANOUT_PARAM;
+
+typedef struct _VIRTGPU_RESOURCE_FLUSH_PARAM {
+    __u32 resource_id;
+    struct virtio_gpu_rect r;
+}VIRTGPU_RESOURCE_FLUSH_PARAM, * PVIRTGPU_RESOURCE_FLUSH_PARAM;
+
 typedef struct _VIRTGPU_TRANSFER_HOST_3D_PARAM {
     struct virtio_gpu_box box;
     __le64 offset;
@@ -364,5 +391,7 @@ VOID DetachResource(PDEVICE_CONTEXT Context, ULONG32 VirglContextId, ULONG32 Res
 VOID UnrefResource(PDEVICE_CONTEXT Context, ULONG32 VirglContextId, ULONG32 ResourceId);
 VOID TransferToHost2D(PDEVICE_CONTEXT Context, ULONG32 VirglContextId, PVIRTGPU_TRANSFER_HOST_2D_PARAM Transfer);
 VOID TransferHost3D(PDEVICE_CONTEXT Context, ULONG32 VirglContextId, PVIRTGPU_TRANSFER_HOST_3D_PARAM Transfer, ULONG64 FenceId, BOOLEAN ToHost);
+VOID SetScanout(PDEVICE_CONTEXT Context, PVIRTGPU_SET_SCANOUT_PARAM SetScanoutParam);
+VOID ResourceFlush(PDEVICE_CONTEXT Context, PVIRTGPU_RESOURCE_FLUSH_PARAM FlushParam);
 NTSTATUS SubmitCommand(PDEVICE_CONTEXT Context, ULONG32 VirglContextId, PMEMORY_DESCRIPTOR Command, SIZE_T CommandBufSize, SIZE_T CommandSize,
     PVOID ResourceIds, SIZE_T ResourceIdsCount, ULONG64 FenceId, PVOID FenceObject);

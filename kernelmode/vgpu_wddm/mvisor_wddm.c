@@ -8,6 +8,7 @@
 
 #include <ntddk.h>
 #include <dispmprt.h>
+#include "../vgpu/ioctl.h"
 
 #define MVISOR_WDDM_TAG 'WvMM'
 #define MVISOR_WDDM_MAX_VIEWS 1
@@ -19,8 +20,6 @@
 #define MVISOR_WDDM_BRIDGE_SCANOUT_ID 0
 #define MVISOR_WDDM_BRIDGE_RESOURCE_ID 1
 #define MVISOR_WDDM_BRIDGE_LOG_INTERVAL 120
-#define MVISOR_WDDM_VIRTIO_GPU_CMD_SET_SCANOUT 0x0103
-#define MVISOR_WDDM_VIRTIO_GPU_CMD_RESOURCE_FLUSH 0x0104
 
 #ifndef DXGKDDI_WDDMv1_3
 #define DXGKDDI_WDDMv1_3 DXGKDDI_WDDMv1_2
@@ -28,26 +27,6 @@
 
 #define MVISOR_WDDM_LOG(fmt, ...) \
     DbgPrintEx(DPFLTR_IHVVIDEO_ID, DPFLTR_INFO_LEVEL, "mvisor_wddm: " fmt "\n", __VA_ARGS__)
-
-typedef struct _MVISOR_WDDM_BRIDGE_RECT {
-    ULONG X;
-    ULONG Y;
-    ULONG Width;
-    ULONG Height;
-} MVISOR_WDDM_BRIDGE_RECT, *PMVISOR_WDDM_BRIDGE_RECT;
-
-typedef struct _MVISOR_WDDM_BRIDGE_SET_SCANOUT_CMD {
-    ULONG Type;
-    ULONG ScanoutId;
-    ULONG ResourceId;
-    MVISOR_WDDM_BRIDGE_RECT Rect;
-} MVISOR_WDDM_BRIDGE_SET_SCANOUT_CMD, *PMVISOR_WDDM_BRIDGE_SET_SCANOUT_CMD;
-
-typedef struct _MVISOR_WDDM_BRIDGE_RESOURCE_FLUSH_CMD {
-    ULONG Type;
-    ULONG ResourceId;
-    MVISOR_WDDM_BRIDGE_RECT Rect;
-} MVISOR_WDDM_BRIDGE_RESOURCE_FLUSH_CMD, *PMVISOR_WDDM_BRIDGE_RESOURCE_FLUSH_CMD;
 
 typedef struct _MVISOR_WDDM_DEVICE_CONTEXT {
     DEVICE_OBJECT* PhysicalDeviceObject;
@@ -66,6 +45,9 @@ typedef struct _MVISOR_WDDM_DEVICE_CONTEXT {
     ULONG64 BridgeSetScanoutCount;
     ULONG64 BridgeFlushCount;
     ULONG64 BridgeDropCount;
+    ULONG64 BridgeIoctlFailCount;
+    ULONG64 BridgeNoInterfaceCount;
+    HANDLE BridgeIoctlHandle;
     PVOID ShadowFrameBuffer;
     SIZE_T ShadowFrameBufferSize;
     KSPIN_LOCK PresentLock;
@@ -229,68 +211,201 @@ static VOID
 MvisorWddmBuildBridgeRect(
     _In_ ULONG width,
     _In_ ULONG height,
-    _Out_ PMVISOR_WDDM_BRIDGE_RECT rect)
+    _Out_ struct virtio_vgpu_rect* rect)
 {
-    rect->X = 0;
-    rect->Y = 0;
-    rect->Width = width;
-    rect->Height = height;
+    rect->x = 0;
+    rect->y = 0;
+    rect->width = width;
+    rect->height = height;
 }
 
-/*
- * Bridge stubs are called while PresentLock is held.
- * They model SET_SCANOUT/RESOURCE_FLUSH envelopes for telemetry only.
- */
 static VOID
-MvisorWddmSubmitBridgePresentLocked(
+MvisorWddmCloseBridgeInterface(_Inout_ PMVISOR_WDDM_DEVICE_CONTEXT context)
+{
+    HANDLE handle = context->BridgeIoctlHandle;
+    context->BridgeIoctlHandle = NULL;
+    if (handle != NULL) {
+        ZwClose(handle);
+    }
+}
+
+static NTSTATUS
+MvisorWddmEnsureBridgeInterface(
+    _Inout_ PMVISOR_WDDM_DEVICE_CONTEXT context,
+    _Out_ HANDLE* bridgeHandle)
+{
+    NTSTATUS status;
+    PWSTR interfaces;
+    UNICODE_STRING name;
+    OBJECT_ATTRIBUTES attributes;
+    IO_STATUS_BLOCK ioStatus;
+    HANDLE handle;
+
+    if (bridgeHandle == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (context->BridgeIoctlHandle != NULL) {
+        *bridgeHandle = context->BridgeIoctlHandle;
+        return STATUS_SUCCESS;
+    }
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        context->BridgeNoInterfaceCount++;
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    interfaces = NULL;
+    status = IoGetDeviceInterfaces((LPGUID)&GUID_DEVINTERFACE_VGPU, NULL, 0, &interfaces);
+    if (!NT_SUCCESS(status)) {
+        context->BridgeNoInterfaceCount++;
+        return status;
+    }
+
+    if (interfaces == NULL || interfaces[0] == L'\0') {
+        if (interfaces != NULL) {
+            ExFreePool(interfaces);
+        }
+        context->BridgeNoInterfaceCount++;
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
+    RtlInitUnicodeString(&name, interfaces);
+    InitializeObjectAttributes(&attributes, &name, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    status = ZwCreateFile(
+        &handle,
+        GENERIC_READ | GENERIC_WRITE,
+        &attributes,
+        &ioStatus,
+        NULL,
+        FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+        NULL,
+        0);
+
+    ExFreePool(interfaces);
+
+    if (!NT_SUCCESS(status)) {
+        context->BridgeNoInterfaceCount++;
+        return status;
+    }
+
+    context->BridgeIoctlHandle = handle;
+    *bridgeHandle = handle;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+MvisorWddmIssueBridgeIoctl(
+    _Inout_ PMVISOR_WDDM_DEVICE_CONTEXT context,
+    _In_ ULONG ioctlCode,
+    _In_reads_bytes_(inputSize) PVOID inputBuffer,
+    _In_ ULONG inputSize)
+{
+    NTSTATUS status;
+    HANDLE handle;
+    IO_STATUS_BLOCK ioStatus;
+
+    status = MvisorWddmEnsureBridgeInterface(context, &handle);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = ZwDeviceIoControlFile(
+        handle,
+        NULL,
+        NULL,
+        NULL,
+        &ioStatus,
+        ioctlCode,
+        inputBuffer,
+        inputSize,
+        NULL,
+        0);
+    if (!NT_SUCCESS(status)) {
+        context->BridgeIoctlFailCount++;
+        if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+            MvisorWddmCloseBridgeInterface(context);
+        }
+    }
+
+    return status;
+}
+
+static NTSTATUS
+MvisorWddmSubmitBridgePresent(
     _Inout_ PMVISOR_WDDM_DEVICE_CONTEXT context,
     _In_ ULONG width,
     _In_ ULONG height)
 {
-    MVISOR_WDDM_BRIDGE_SET_SCANOUT_CMD setScanoutCmd;
-    MVISOR_WDDM_BRIDGE_RESOURCE_FLUSH_CMD flushCmd;
+    NTSTATUS status;
+    struct virtio_vgpu_set_scanout setScanoutCmd;
+    struct virtio_vgpu_resource_flush flushCmd;
 
     if (width == 0 || height == 0) {
         context->BridgeDropCount++;
-        return;
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        context->BridgeDropCount++;
+        return STATUS_INVALID_DEVICE_STATE;
     }
 
     if (context->BridgeScanoutWidth != width || context->BridgeScanoutHeight != height) {
         RtlZeroMemory(&setScanoutCmd, sizeof(setScanoutCmd));
-        setScanoutCmd.Type = MVISOR_WDDM_VIRTIO_GPU_CMD_SET_SCANOUT;
-        setScanoutCmd.ScanoutId = MVISOR_WDDM_BRIDGE_SCANOUT_ID;
-        setScanoutCmd.ResourceId = context->BridgeResourceId;
-        MvisorWddmBuildBridgeRect(width, height, &setScanoutCmd.Rect);
+        setScanoutCmd.scanout_id = MVISOR_WDDM_BRIDGE_SCANOUT_ID;
+        setScanoutCmd.resource_id = context->BridgeResourceId;
+        MvisorWddmBuildBridgeRect(width, height, &setScanoutCmd.rect);
+
+        status = MvisorWddmIssueBridgeIoctl(
+            context,
+            IOCTL_VIRTIO_VGPU_SET_SCANOUT,
+            &setScanoutCmd,
+            sizeof(setScanoutCmd));
+        if (!NT_SUCCESS(status)) {
+            context->BridgeDropCount++;
+            return status;
+        }
 
         context->BridgeScanoutWidth = width;
         context->BridgeScanoutHeight = height;
         context->BridgeSetScanoutCount++;
-
-        MVISOR_WDDM_LOG(
-            "bridge-stub set_scanout type=0x%lx scanout=%lu resource=%lu rect=%lux%lu",
-            setScanoutCmd.Type,
-            setScanoutCmd.ScanoutId,
-            setScanoutCmd.ResourceId,
-            setScanoutCmd.Rect.Width,
-            setScanoutCmd.Rect.Height);
+        MVISOR_WDDM_LOG("bridge-ioctl set_scanout scanout=%lu resource=%lu rect=%lux%lu",
+            setScanoutCmd.scanout_id,
+            setScanoutCmd.resource_id,
+            setScanoutCmd.rect.width,
+            setScanoutCmd.rect.height);
     }
 
     RtlZeroMemory(&flushCmd, sizeof(flushCmd));
-    flushCmd.Type = MVISOR_WDDM_VIRTIO_GPU_CMD_RESOURCE_FLUSH;
-    flushCmd.ResourceId = context->BridgeResourceId;
-    MvisorWddmBuildBridgeRect(width, height, &flushCmd.Rect);
-    context->BridgeFlushCount++;
+    flushCmd.resource_id = context->BridgeResourceId;
+    MvisorWddmBuildBridgeRect(width, height, &flushCmd.rect);
 
-    if ((context->BridgeFlushCount % MVISOR_WDDM_BRIDGE_LOG_INTERVAL) == 0) {
-        MVISOR_WDDM_LOG(
-            "bridge-stub flush type=0x%lx resource=%lu rect=%lux%lu count=%llu drops=%llu",
-            flushCmd.Type,
-            flushCmd.ResourceId,
-            flushCmd.Rect.Width,
-            flushCmd.Rect.Height,
-            context->BridgeFlushCount,
-            context->BridgeDropCount);
+    status = MvisorWddmIssueBridgeIoctl(
+        context,
+        IOCTL_VIRTIO_VGPU_RESOURCE_FLUSH,
+        &flushCmd,
+        sizeof(flushCmd));
+    if (!NT_SUCCESS(status)) {
+        context->BridgeDropCount++;
+        return status;
     }
+
+    context->BridgeFlushCount++;
+    if ((context->BridgeFlushCount % MVISOR_WDDM_BRIDGE_LOG_INTERVAL) == 0) {
+        MVISOR_WDDM_LOG("bridge-ioctl flush resource=%lu rect=%lux%lu count=%llu drops=%llu fails=%llu",
+            flushCmd.resource_id,
+            flushCmd.rect.width,
+            flushCmd.rect.height,
+            context->BridgeFlushCount,
+            context->BridgeDropCount,
+            context->BridgeIoctlFailCount);
+    }
+
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS
@@ -412,8 +527,15 @@ MvisorWddmStageSystemDisplayFrame(
     }
 
     MvisorWddmUpdateFrameStats(context, sourceWidth, sourceHeight, sourceStride, 4);
-    MvisorWddmSubmitBridgePresentLocked(context, sourceWidth, sourceHeight);
     KeReleaseSpinLock(&context->PresentLock, oldIrql);
+
+    status = MvisorWddmSubmitBridgePresent(context, sourceWidth, sourceHeight);
+    if (!NT_SUCCESS(status) && ((context->BridgeDropCount % MVISOR_WDDM_BRIDGE_LOG_INTERVAL) == 0)) {
+        MVISOR_WDDM_LOG("bridge submit failed in SystemDisplayWrite status=0x%08x drops=%llu",
+            status,
+            context->BridgeDropCount);
+    }
+
     return STATUS_SUCCESS;
 }
 
@@ -491,7 +613,6 @@ MvisorWddmStagePresentFrame(
     }
 
     MvisorWddmUpdateFrameStats(context, width, height, present->Pitch, present->BytesPerPixel);
-    MvisorWddmSubmitBridgePresentLocked(context, width, height);
 
     if ((context->PresentCount % 120) == 0) {
         MVISOR_WDDM_LOG("present-staged frames=%llu size=%lux%lu pitch=%lu dirty=%lu/%u",
@@ -504,6 +625,14 @@ MvisorWddmStagePresentFrame(
     }
 
     KeReleaseSpinLock(&context->PresentLock, oldIrql);
+
+    status = MvisorWddmSubmitBridgePresent(context, width, height);
+    if (!NT_SUCCESS(status) && ((context->BridgeDropCount % MVISOR_WDDM_BRIDGE_LOG_INTERVAL) == 0)) {
+        MVISOR_WDDM_LOG("bridge submit failed in PresentDisplayOnly status=0x%08x drops=%llu",
+            status,
+            context->BridgeDropCount);
+    }
+
     return STATUS_SUCCESS;
 }
 
@@ -555,6 +684,7 @@ MvisorWddmRemoveDevice(_In_ VOID* MiniportDeviceContext)
 
     context = (PMVISOR_WDDM_DEVICE_CONTEXT)MiniportDeviceContext;
     if (context != NULL) {
+        MvisorWddmCloseBridgeInterface(context);
         if (context->ShadowFrameBuffer != NULL) {
             ExFreePoolWithTag(context->ShadowFrameBuffer, MVISOR_WDDM_TAG);
             context->ShadowFrameBuffer = NULL;
@@ -598,6 +728,14 @@ MvisorWddmStartDevice(
     *NumberOfChildren = MVISOR_WDDM_MAX_CHILDREN;
 
     context->Started = TRUE;
+
+    status = MvisorWddmEnsureBridgeInterface(context, &context->BridgeIoctlHandle);
+    if (NT_SUCCESS(status)) {
+        MVISOR_WDDM_LOG("%s", "bridge interface connected");
+    } else {
+        MVISOR_WDDM_LOG("bridge interface unavailable status=0x%08x", status);
+    }
+
     MVISOR_WDDM_LOG("StartDevice views=%lu children=%lu", *NumberOfViews, *NumberOfChildren);
 
     return STATUS_SUCCESS;
@@ -620,6 +758,7 @@ MvisorWddmStopDevice(_In_ VOID* MiniportDeviceContext)
     context->Height = 0;
     context->Pitch = 0;
     context->BytesPerPixel = 0;
+    MvisorWddmCloseBridgeInterface(context);
 
     return STATUS_SUCCESS;
 }

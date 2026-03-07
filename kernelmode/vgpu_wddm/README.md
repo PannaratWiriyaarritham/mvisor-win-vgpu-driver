@@ -10,7 +10,7 @@ Current status:
 - Uses KMDOD registration (`DxgkInitializeDisplayOnlyDriver`)
 - `PresentDisplayOnly` stages full/dirty-rect updates into a guarded shadow buffer
 - `SystemDisplayWrite` also stages boot/crash-path frames into the same shadow buffer
-- Present paths emit bridge command stubs for `SET_SCANOUT` and `RESOURCE_FLUSH` telemetry
+- Present paths attempt real bridge IOCTL submission (`SET_SCANOUT`/`RESOURCE_FLUSH`) through `GUID_DEVINTERFACE_VGPU`, with fallback when interface is unavailable
 - Not yet wired to virtio-vgpu queues or real host present/scanout path
 
 ## Why this exists
@@ -52,6 +52,6 @@ Expected output artifacts (under project `x64\Release\` intermediate/output path
 ## Next Integration Tasks
 
 1. Implement real adapter capability reporting in `DxgkDdiQueryAdapterInfo`.
-2. Replace bridge stubs with real virtio-vgpu transport submission path.
+2. Remove fallback behavior by making bridge transport mandatory and verified for all present paths.
 3. Connect mode-setting callbacks (`CommitVidPn`, `SetVidPnSourceVisibility`) to host scanout protocol.
 4. Add interrupt/fence synchronization for DWM-friendly present timing.

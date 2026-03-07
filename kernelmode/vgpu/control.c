@@ -843,6 +843,77 @@ NTSTATUS CtlTransferHost(IN BOOLEAN ToHost, IN WDFREQUEST Request, IN size_t Inp
     return status;
 }
 
+NTSTATUS CtlSetScanout(IN PDEVICE_CONTEXT Context, IN WDFREQUEST Request, IN size_t InputBufferLength, OUT size_t* bytesReturn)
+{
+    NTSTATUS status;
+    VIRTGPU_SET_SCANOUT_PARAM scanout;
+    struct virtio_vgpu_set_scanout* cmd;
+
+    status = WdfRequestRetrieveInputBuffer(Request, InputBufferLength, &cmd, bytesReturn);
+    if (!NT_SUCCESS(status))
+    {
+        VGPU_DEBUG_LOG("WdfRequestRetrieveInputBuffer failed status=0x%08x", status);
+        return status;
+    }
+
+    if (*bytesReturn != sizeof(struct virtio_vgpu_set_scanout))
+    {
+        VGPU_DEBUG_LOG("get wrong buffer size=%lld", *bytesReturn);
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    if (cmd->rect.width == 0 || cmd->rect.height == 0)
+    {
+        VGPU_DEBUG_LOG("invalid scanout rect width=%u height=%u", cmd->rect.width, cmd->rect.height);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    scanout.scanout_id = cmd->scanout_id;
+    scanout.resource_id = cmd->resource_id;
+    scanout.r.x = cmd->rect.x;
+    scanout.r.y = cmd->rect.y;
+    scanout.r.width = cmd->rect.width;
+    scanout.r.height = cmd->rect.height;
+
+    SetScanout(Context, &scanout);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS CtlResourceFlush(IN PDEVICE_CONTEXT Context, IN WDFREQUEST Request, IN size_t InputBufferLength, OUT size_t* bytesReturn)
+{
+    NTSTATUS status;
+    VIRTGPU_RESOURCE_FLUSH_PARAM flush;
+    struct virtio_vgpu_resource_flush* cmd;
+
+    status = WdfRequestRetrieveInputBuffer(Request, InputBufferLength, &cmd, bytesReturn);
+    if (!NT_SUCCESS(status))
+    {
+        VGPU_DEBUG_LOG("WdfRequestRetrieveInputBuffer failed status=0x%08x", status);
+        return status;
+    }
+
+    if (*bytesReturn != sizeof(struct virtio_vgpu_resource_flush))
+    {
+        VGPU_DEBUG_LOG("get wrong buffer size=%lld", *bytesReturn);
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    if (cmd->rect.width == 0 || cmd->rect.height == 0)
+    {
+        VGPU_DEBUG_LOG("invalid flush rect width=%u height=%u", cmd->rect.width, cmd->rect.height);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    flush.resource_id = cmd->resource_id;
+    flush.r.x = cmd->rect.x;
+    flush.r.y = cmd->rect.y;
+    flush.r.width = cmd->rect.width;
+    flush.r.height = cmd->rect.height;
+
+    ResourceFlush(Context, &flush);
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS CtlSubmitCommand(IN WDFREQUEST Request, IN size_t InputBufferLength, OUT size_t* bytesReturn)
 {
     NTSTATUS                        status;
