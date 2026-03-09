@@ -868,8 +868,6 @@ MvisorWddmQueryChildStatus(
     _Inout_ DXGK_CHILD_STATUS* ChildStatus,
     _In_ BOOLEAN NonDestructiveOnly)
 {
-    PMVISOR_WDDM_DEVICE_CONTEXT context;
-
     UNREFERENCED_PARAMETER(NonDestructiveOnly);
     PAGED_CODE();
 
@@ -877,14 +875,12 @@ MvisorWddmQueryChildStatus(
         return STATUS_INVALID_PARAMETER;
     }
 
-    context = (PMVISOR_WDDM_DEVICE_CONTEXT)MiniportDeviceContext;
-
     switch (ChildStatus->Type) {
     case StatusConnection:
-        ChildStatus->HotPlug.Connected = context->Started ? TRUE : FALSE;
+        ChildStatus->HotPlug.Connected = TRUE;
         return STATUS_SUCCESS;
     case StatusRotation:
-        return STATUS_SUCCESS;
+        return STATUS_NOT_SUPPORTED;
     default:
         return STATUS_NOT_SUPPORTED;
     }
