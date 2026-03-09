@@ -1,6 +1,7 @@
 param(
     [string]$InfPath = ".\kernelmode\vgpu_wddm\x64\Release\mvisor_wddm\mvisor_wddm.inf",
     [int]$SetupApiTail = 250,
+    [switch]$RemoveVgpuConflict = $true,
     [switch]$Reboot
 )
 
@@ -25,6 +26,10 @@ $driverLines = & pnputil /enum-drivers
 
 $currentPublished = $null
 $mvisorOemInfs = New-Object System.Collections.Generic.List[string]
+$conflictOriginalNames = @("mvisor_wddm.inf")
+if ($RemoveVgpuConflict) {
+    $conflictOriginalNames += "vgpu.inf"
+}
 
 foreach ($line in $driverLines) {
     if ($line -match "^\s*Published Name\s*:\s*(oem\d+\.inf)\s*$") {
@@ -35,7 +40,7 @@ foreach ($line in $driverLines) {
     if ($line -match "^\s*Original Name\s*:\s*(.+)\s*$") {
         if ($null -ne $currentPublished) {
             $originalName = $Matches[1].Trim().ToLowerInvariant()
-            if ($originalName -eq "mvisor_wddm.inf") {
+            if ($conflictOriginalNames -contains $originalName) {
                 $mvisorOemInfs.Add($currentPublished)
             }
         }
@@ -45,12 +50,16 @@ foreach ($line in $driverLines) {
 
 $mvisorOemInfs = $mvisorOemInfs | Sort-Object -Unique
 if ($mvisorOemInfs.Count -gt 0) {
-    Write-Host "[INFO] Removing old mvisor_wddm packages: $($mvisorOemInfs -join ', ')"
+    if ($RemoveVgpuConflict) {
+        Write-Host "[INFO] Removing conflicting packages (mvisor_wddm.inf + vgpu.inf): $($mvisorOemInfs -join ', ')"
+    } else {
+        Write-Host "[INFO] Removing old mvisor_wddm packages: $($mvisorOemInfs -join ', ')"
+    }
     foreach ($oemInf in $mvisorOemInfs) {
         & pnputil /delete-driver $oemInf /uninstall /force
     }
 } else {
-    Write-Host "[INFO] No old mvisor_wddm OEM packages found."
+    Write-Host "[INFO] No matching OEM packages found for cleanup."
 }
 
 Write-Host "[INFO] Installing new package..."
@@ -77,4 +86,3 @@ if ($Reboot) {
 } else {
     Write-Host "[INFO] Reboot is recommended after install."
 }
-
