@@ -167,8 +167,6 @@ MvisorWddmQueryChildRelations(
     _Out_writes_bytes_(ChildRelationsSize) DXGK_CHILD_DESCRIPTOR* ChildRelations,
     _In_ ULONG ChildRelationsSize)
 {
-    ULONG childCount;
-
     UNREFERENCED_PARAMETER(MiniportDeviceContext);
     PAGED_CODE();
 
@@ -177,23 +175,13 @@ MvisorWddmQueryChildRelations(
     }
 
     RtlZeroMemory(ChildRelations, ChildRelationsSize);
-
-    childCount = (ChildRelationsSize / sizeof(DXGK_CHILD_DESCRIPTOR));
-    if (childCount > 1) {
-        childCount -= 1;
-    } else {
-        childCount = 0;
-    }
-
-    if (childCount > 0) {
-        ChildRelations[0].ChildDeviceType = TypeVideoOutput;
-        ChildRelations[0].ChildCapabilities.HpdAwareness = HpdAwarenessInterruptible;
-        ChildRelations[0].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = D3DKMDT_VOT_OTHER;
-        ChildRelations[0].ChildCapabilities.Type.VideoOutput.MonitorOrientationAwareness = D3DKMDT_MOA_NONE;
-        ChildRelations[0].ChildCapabilities.Type.VideoOutput.SupportsSdtvModes = FALSE;
-        ChildRelations[0].AcpiUid = 0;
-        ChildRelations[0].ChildUid = 0;
-    }
+    ChildRelations[0].ChildDeviceType = TypeVideoOutput;
+    ChildRelations[0].ChildCapabilities.HpdAwareness = HpdAwarenessAlwaysConnected;
+    ChildRelations[0].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = D3DKMDT_VOT_OTHER;
+    ChildRelations[0].ChildCapabilities.Type.VideoOutput.MonitorOrientationAwareness = D3DKMDT_MOA_NONE;
+    ChildRelations[0].ChildCapabilities.Type.VideoOutput.SupportsSdtvModes = FALSE;
+    ChildRelations[0].AcpiUid = 0;
+    ChildRelations[0].ChildUid = 0;
 
     return STATUS_SUCCESS;
 }
@@ -204,8 +192,6 @@ MvisorWddmQueryChildStatus(
     _Inout_ DXGK_CHILD_STATUS* ChildStatus,
     _In_ BOOLEAN NonDestructiveOnly)
 {
-    PMVISOR_WDDM_DEVICE_CONTEXT context;
-
     UNREFERENCED_PARAMETER(NonDestructiveOnly);
     PAGED_CODE();
 
@@ -213,14 +199,12 @@ MvisorWddmQueryChildStatus(
         return STATUS_INVALID_PARAMETER;
     }
 
-    context = (PMVISOR_WDDM_DEVICE_CONTEXT)MiniportDeviceContext;
-
     switch (ChildStatus->Type) {
     case StatusConnection:
-        ChildStatus->HotPlug.Connected = context->Started ? TRUE : FALSE;
+        ChildStatus->HotPlug.Connected = TRUE;
         return STATUS_SUCCESS;
     case StatusRotation:
-        return STATUS_INVALID_PARAMETER;
+        return STATUS_NOT_SUPPORTED;
     default:
         return STATUS_NOT_SUPPORTED;
     }
