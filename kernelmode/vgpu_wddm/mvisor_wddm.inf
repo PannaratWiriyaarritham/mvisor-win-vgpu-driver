@@ -1,6 +1,6 @@
 ;
 ; mvisor_wddm.inf
-; BuildTimestamp=2026-03-10T00:10:00+07:00
+; BuildTimestamp=2026-03-10T00:35:00+07:00
 ;
 
 [Version]
@@ -9,7 +9,7 @@ Class=Display
 ClassGUID={4d36e968-e325-11ce-bfc1-08002be10318}
 Provider=%ManufacturerName%
 CatalogFile=mvisor_wddm.cat
-DriverVer=03/10/2026,4.50.46.36
+DriverVer=03/10/2026,4.50.46.37
 PnpLockDown=1
 
 [DestinationDirs]
@@ -26,6 +26,8 @@ mvisor_wddm.sys = 1,,
 %ManufacturerName%=Mvisor,NTamd64
 
 [Mvisor.NTamd64]
+%MvisorWddm.DeviceDesc%=MvisorWddm_Install, PCI\VEN_1AF4&DEV_105B&SUBSYS_11001AF4&REV_01
+%MvisorWddm.DeviceDesc%=MvisorWddm_Install, PCI\VEN_1AF4&DEV_105B&SUBSYS_11001AF4
 %MvisorWddm.DeviceDesc%=MvisorWddm_Install, PCI\VEN_1AF4&DEV_105B&REV_01
 %MvisorWddm.DeviceDesc%=MvisorWddm_Install, PCI\VEN_1AF4&DEV_105B
 
