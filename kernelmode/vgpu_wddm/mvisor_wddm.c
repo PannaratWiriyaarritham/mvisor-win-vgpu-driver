@@ -8,7 +8,7 @@
 
 #include <ntddk.h>
 #include <dispmprt.h>
-#include "../vgpu/ioctl.h"
+#include <initguid.h>
 
 #define MVISOR_WDDM_TAG 'WvMM'
 #define MVISOR_WDDM_MAX_VIEWS 1
@@ -20,6 +20,42 @@
 #define MVISOR_WDDM_BRIDGE_SCANOUT_ID 0
 #define MVISOR_WDDM_BRIDGE_RESOURCE_ID 1
 #define MVISOR_WDDM_BRIDGE_LOG_INTERVAL 120
+
+/*
+ * Local bridge IOCTL declarations for WDDM miniport.
+ * Keep these independent from kernelmode/vgpu/ioctl.h to avoid pulling
+ * linux/* headers into this standalone VS/WDK project.
+ */
+// 31c22912-7210-11ed-bf22-bce92fa2e22d
+DEFINE_GUID(GUID_DEVINTERFACE_VGPU, 0x31c22912, 0x7210, 0x11ed, 0xbf, 0x22, 0xbc, 0xe9, 0x2f, 0xa2, 0xe2, 0x2d);
+
+#define IOCTL_VIRTIO_VGPU_SET_SCANOUT CTL_CODE(FILE_DEVICE_UNKNOWN, \
+    0x812, \
+    METHOD_IN_DIRECT, \
+    FILE_ANY_ACCESS)
+
+#define IOCTL_VIRTIO_VGPU_RESOURCE_FLUSH CTL_CODE(FILE_DEVICE_UNKNOWN, \
+    0x813, \
+    METHOD_IN_DIRECT, \
+    FILE_ANY_ACCESS)
+
+struct virtio_vgpu_rect {
+    ULONG x;
+    ULONG y;
+    ULONG width;
+    ULONG height;
+};
+
+struct virtio_vgpu_set_scanout {
+    ULONG scanout_id;
+    ULONG resource_id;
+    struct virtio_vgpu_rect rect;
+};
+
+struct virtio_vgpu_resource_flush {
+    ULONG resource_id;
+    struct virtio_vgpu_rect rect;
+};
 
 #ifndef DXGKDDI_WDDMv1_3
 #define DXGKDDI_WDDMv1_3 DXGKDDI_WDDMv1_2
