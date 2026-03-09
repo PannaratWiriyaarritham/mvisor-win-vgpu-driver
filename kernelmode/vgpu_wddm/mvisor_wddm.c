@@ -852,7 +852,7 @@ MvisorWddmQueryChildRelations(
 
     RtlZeroMemory(ChildRelations, ChildRelationsSize);
     ChildRelations[0].ChildDeviceType = TypeVideoOutput;
-    ChildRelations[0].ChildCapabilities.HpdAwareness = HpdAwarenessInterruptible;
+    ChildRelations[0].ChildCapabilities.HpdAwareness = HpdAwarenessAlwaysConnected;
     ChildRelations[0].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = D3DKMDT_VOT_OTHER;
     ChildRelations[0].ChildCapabilities.Type.VideoOutput.MonitorOrientationAwareness = D3DKMDT_MOA_NONE;
     ChildRelations[0].ChildCapabilities.Type.VideoOutput.SupportsSdtvModes = FALSE;
@@ -884,7 +884,7 @@ MvisorWddmQueryChildStatus(
         ChildStatus->HotPlug.Connected = context->Started ? TRUE : FALSE;
         return STATUS_SUCCESS;
     case StatusRotation:
-        return STATUS_INVALID_PARAMETER;
+        return STATUS_SUCCESS;
     default:
         return STATUS_NOT_SUPPORTED;
     }
