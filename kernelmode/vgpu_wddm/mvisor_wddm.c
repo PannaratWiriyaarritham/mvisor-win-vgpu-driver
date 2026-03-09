@@ -264,6 +264,69 @@ MvisorWddmBuildBridgeRect(
     rect->height = height;
 }
 
+static NTSTATUS
+MvisorWddmAddSingleMonitorMode(
+    _In_ PMVISOR_WDDM_DEVICE_CONTEXT context,
+    _In_ CONST DXGKARG_RECOMMENDMONITORMODES* recommendMonitorModes)
+{
+    NTSTATUS status;
+    D3DKMDT_MONITOR_SOURCE_MODE* mode;
+    ULONG width;
+    ULONG height;
+
+    if (context == NULL || recommendMonitorModes == NULL ||
+        recommendMonitorModes->pMonitorSourceModeSetInterface == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    mode = NULL;
+    status = recommendMonitorModes->pMonitorSourceModeSetInterface->pfnCreateNewModeInfo(
+        recommendMonitorModes->hMonitorSourceModeSet,
+        &mode);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    width = (context->Width != 0) ? context->Width : 1024;
+    height = (context->Height != 0) ? context->Height : 768;
+
+    RtlZeroMemory(mode, sizeof(*mode));
+    mode->VideoSignalInfo.VideoStandard = D3DKMDT_VSS_OTHER;
+    mode->VideoSignalInfo.TotalSize.cx = width;
+    mode->VideoSignalInfo.TotalSize.cy = height;
+    mode->VideoSignalInfo.ActiveSize = mode->VideoSignalInfo.TotalSize;
+    mode->VideoSignalInfo.VSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
+    mode->VideoSignalInfo.VSyncFreq.Denominator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
+    mode->VideoSignalInfo.HSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
+    mode->VideoSignalInfo.HSyncFreq.Denominator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
+    mode->VideoSignalInfo.PixelRate = D3DKMDT_FREQUENCY_NOTSPECIFIED;
+    mode->VideoSignalInfo.ScanLineOrdering = D3DDDI_VSSLO_PROGRESSIVE;
+    mode->Origin = D3DKMDT_MCO_DRIVER;
+    mode->Preference = D3DKMDT_MP_PREFERRED;
+    mode->ColorBasis = D3DKMDT_CB_SRGB;
+    mode->ColorCoeffDynamicRanges.FirstChannel = 8;
+    mode->ColorCoeffDynamicRanges.SecondChannel = 8;
+    mode->ColorCoeffDynamicRanges.ThirdChannel = 8;
+    mode->ColorCoeffDynamicRanges.FourthChannel = 8;
+
+    status = recommendMonitorModes->pMonitorSourceModeSetInterface->pfnAddMode(
+        recommendMonitorModes->hMonitorSourceModeSet,
+        mode);
+    if (!NT_SUCCESS(status)) {
+        NTSTATUS releaseStatus;
+        releaseStatus = recommendMonitorModes->pMonitorSourceModeSetInterface->pfnReleaseModeInfo(
+            recommendMonitorModes->hMonitorSourceModeSet,
+            mode);
+        UNREFERENCED_PARAMETER(releaseStatus);
+        if (status == STATUS_GRAPHICS_MODE_ALREADY_IN_MODESET) {
+            return STATUS_SUCCESS;
+        }
+        return status;
+    }
+
+    return STATUS_SUCCESS;
+}
+
 static VOID
 MvisorWddmCloseBridgeInterface(_Inout_ PMVISOR_WDDM_DEVICE_CONTEXT context)
 {
@@ -852,6 +915,8 @@ MvisorWddmQueryChildRelations(
     _Out_writes_bytes_(ChildRelationsSize) DXGK_CHILD_DESCRIPTOR* ChildRelations,
     _In_ ULONG ChildRelationsSize)
 {
+    ULONG childCount;
+
     UNREFERENCED_PARAMETER(MiniportDeviceContext);
     PAGED_CODE();
 
@@ -860,13 +925,26 @@ MvisorWddmQueryChildRelations(
     }
 
     RtlZeroMemory(ChildRelations, ChildRelationsSize);
-    ChildRelations[0].ChildDeviceType = TypeVideoOutput;
-    ChildRelations[0].ChildCapabilities.HpdAwareness = HpdAwarenessInterruptible;
-    ChildRelations[0].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = D3DKMDT_VOT_OTHER;
-    ChildRelations[0].ChildCapabilities.Type.VideoOutput.MonitorOrientationAwareness = D3DKMDT_MOA_NONE;
-    ChildRelations[0].ChildCapabilities.Type.VideoOutput.SupportsSdtvModes = FALSE;
-    ChildRelations[0].AcpiUid = 0;
-    ChildRelations[0].ChildUid = 0;
+
+    /*
+     * DXGK expects the last descriptor entry to remain zeroed as a terminator.
+     */
+    childCount = (ChildRelationsSize / sizeof(DXGK_CHILD_DESCRIPTOR));
+    if (childCount > 1) {
+        childCount -= 1;
+    } else {
+        childCount = 0;
+    }
+
+    if (childCount > 0) {
+        ChildRelations[0].ChildDeviceType = TypeVideoOutput;
+        ChildRelations[0].ChildCapabilities.HpdAwareness = HpdAwarenessInterruptible;
+        ChildRelations[0].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = D3DKMDT_VOT_OTHER;
+        ChildRelations[0].ChildCapabilities.Type.VideoOutput.MonitorOrientationAwareness = D3DKMDT_MOA_NONE;
+        ChildRelations[0].ChildCapabilities.Type.VideoOutput.SupportsSdtvModes = FALSE;
+        ChildRelations[0].AcpiUid = 0;
+        ChildRelations[0].ChildUid = 0;
+    }
 
     return STATUS_SUCCESS;
 }
@@ -1068,12 +1146,59 @@ MvisorWddmIsSupportedVidPn(
     _In_ CONST HANDLE hAdapter,
     _Inout_ DXGKARG_ISSUPPORTEDVIDPN* IsSupportedVidPn)
 {
-    UNREFERENCED_PARAMETER(hAdapter);
+    NTSTATUS status;
+    PMVISOR_WDDM_DEVICE_CONTEXT context;
+    CONST DXGK_VIDPN_INTERFACE* vidPnInterface;
+    D3DKMDT_HVIDPNTOPOLOGY topologyHandle;
+    CONST DXGK_VIDPNTOPOLOGY_INTERFACE* topologyInterface;
+    D3DDDI_VIDEO_PRESENT_SOURCE_ID sourceId;
 
     PAGED_CODE();
 
-    if (IsSupportedVidPn == NULL) {
+    if (hAdapter == NULL || IsSupportedVidPn == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    context = MvisorWddmContextFromAdapterHandle(hAdapter);
+
+    if (IsSupportedVidPn->hDesiredVidPn == 0) {
+        IsSupportedVidPn->IsVidPnSupported = TRUE;
+        return STATUS_SUCCESS;
+    }
+
+    IsSupportedVidPn->IsVidPnSupported = FALSE;
+
+    status = context->DxgkInterface.DxgkCbQueryVidPnInterface(
+        IsSupportedVidPn->hDesiredVidPn,
+        DXGK_VIDPN_INTERFACE_VERSION_V1,
+        &vidPnInterface);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = vidPnInterface->pfnGetTopology(
+        IsSupportedVidPn->hDesiredVidPn,
+        &topologyHandle,
+        &topologyInterface);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    for (sourceId = 0; sourceId < MVISOR_WDDM_MAX_VIEWS; sourceId++) {
+        SIZE_T pathCount = 0;
+        status = topologyInterface->pfnGetNumPathsFromSource(
+            topologyHandle,
+            sourceId,
+            &pathCount);
+        if (status == STATUS_GRAPHICS_SOURCE_NOT_IN_TOPOLOGY) {
+            continue;
+        }
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+        if (pathCount > MVISOR_WDDM_MAX_CHILDREN) {
+            return STATUS_SUCCESS;
+        }
     }
 
     IsSupportedVidPn->IsVidPnSupported = TRUE;
@@ -1151,11 +1276,16 @@ MvisorWddmRecommendMonitorModes(
     _In_ CONST HANDLE hAdapter,
     _In_ CONST DXGKARG_RECOMMENDMONITORMODES* CONST RecommendMonitorModes)
 {
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(RecommendMonitorModes);
+    PMVISOR_WDDM_DEVICE_CONTEXT context;
+
     PAGED_CODE();
 
-    return STATUS_SUCCESS;
+    if (hAdapter == NULL || RecommendMonitorModes == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    context = MvisorWddmContextFromAdapterHandle(hAdapter);
+    return MvisorWddmAddSingleMonitorMode(context, RecommendMonitorModes);
 }
 
 NTSTATUS
