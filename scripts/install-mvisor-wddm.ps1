@@ -18,12 +18,14 @@ if (-not (Test-IsAdmin)) {
     throw "Run this script in an elevated PowerShell window (Run as Administrator)."
 }
 
-$pnputilPath = Join-Path $env:WINDIR "System32\pnputil.exe"
-if (-not (Test-Path $pnputilPath)) {
-    $pnputilPath = "pnputil.exe"
-}
-if (-not (Get-Command $pnputilPath -ErrorAction SilentlyContinue)) {
-    throw "pnputil.exe not found. Use full path C:\Windows\System32\pnputil.exe or fix PATH."
+$pnputilCandidates = @(
+    (Join-Path $env:WINDIR "System32\pnputil.exe"),
+    (Join-Path $env:WINDIR "Sysnative\pnputil.exe"),
+    (Join-Path $env:WINDIR "SysWOW64\pnputil.exe")
+)
+$pnputilPath = $pnputilCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $pnputilPath) {
+    throw "pnputil.exe not found in expected locations: $($pnputilCandidates -join ', ')"
 }
 
 $resolvedInf = Resolve-Path -Path $InfPath -ErrorAction Stop
