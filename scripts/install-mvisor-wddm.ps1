@@ -58,7 +58,7 @@ foreach ($line in $driverLines) {
     }
 }
 
-$mvisorOemInfs = $mvisorOemInfs | Sort-Object -Unique
+$mvisorOemInfs = @($mvisorOemInfs | Sort-Object -Unique)
 if ($mvisorOemInfs.Count -gt 0) {
     if ($RemoveVgpuConflict) {
         Write-Host "[INFO] Removing conflicting packages (mvisor_wddm.inf + vgpu.inf): $($mvisorOemInfs -join ', ')"
