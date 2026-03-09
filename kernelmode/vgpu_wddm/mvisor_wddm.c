@@ -861,7 +861,7 @@ MvisorWddmQueryChildRelations(
 
     RtlZeroMemory(ChildRelations, ChildRelationsSize);
     ChildRelations[0].ChildDeviceType = TypeVideoOutput;
-    ChildRelations[0].ChildCapabilities.HpdAwareness = HpdAwarenessAlwaysConnected;
+    ChildRelations[0].ChildCapabilities.HpdAwareness = HpdAwarenessInterruptible;
     ChildRelations[0].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = D3DKMDT_VOT_OTHER;
     ChildRelations[0].ChildCapabilities.Type.VideoOutput.MonitorOrientationAwareness = D3DKMDT_MOA_NONE;
     ChildRelations[0].ChildCapabilities.Type.VideoOutput.SupportsSdtvModes = FALSE;
@@ -889,7 +889,7 @@ MvisorWddmQueryChildStatus(
         ChildStatus->HotPlug.Connected = TRUE;
         return STATUS_SUCCESS;
     case StatusRotation:
-        return STATUS_NOT_SUPPORTED;
+        return STATUS_INVALID_PARAMETER;
     default:
         return STATUS_NOT_SUPPORTED;
     }
@@ -954,7 +954,7 @@ MvisorWddmQueryAdapterInfo(
 
         driverCaps = (DXGK_DRIVERCAPS*)QueryAdapterInfo->pOutputData;
         RtlZeroMemory(driverCaps, sizeof(*driverCaps));
-        driverCaps->WDDMVersion = DXGKDDI_WDDMv1_3;
+        driverCaps->WDDMVersion = DXGKDDI_WDDMv1_2;
         driverCaps->HighestAcceptableAddress.QuadPart = -1;
         driverCaps->SupportNonVGA = TRUE;
         driverCaps->SupportSmoothRotation = TRUE;
@@ -1000,7 +1000,7 @@ MvisorWddmSetPointerPosition(
         return STATUS_SUCCESS;
     }
 
-    return STATUS_NOT_SUPPORTED;
+    return STATUS_UNSUCCESSFUL;
 }
 
 NTSTATUS
@@ -1090,7 +1090,7 @@ MvisorWddmRecommendFunctionalVidPn(
     UNREFERENCED_PARAMETER(RecommendFunctionalVidPn);
     PAGED_CODE();
 
-    return STATUS_SUCCESS;
+    return STATUS_GRAPHICS_NO_RECOMMENDED_FUNCTIONAL_VIDPN;
 }
 
 NTSTATUS
