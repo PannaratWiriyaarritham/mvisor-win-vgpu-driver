@@ -18,11 +18,19 @@ if (-not (Test-IsAdmin)) {
     throw "Run this script in an elevated PowerShell window (Run as Administrator)."
 }
 
+$pnputilPath = Join-Path $env:WINDIR "System32\pnputil.exe"
+if (-not (Test-Path $pnputilPath)) {
+    $pnputilPath = "pnputil.exe"
+}
+if (-not (Get-Command $pnputilPath -ErrorAction SilentlyContinue)) {
+    throw "pnputil.exe not found. Use full path C:\Windows\System32\pnputil.exe or fix PATH."
+}
+
 $resolvedInf = Resolve-Path -Path $InfPath -ErrorAction Stop
 Write-Host "[INFO] INF: $resolvedInf"
 
 Write-Host "[INFO] Enumerating installed OEM driver packages..."
-$driverLines = & pnputil /enum-drivers
+$driverLines = & $pnputilPath /enum-drivers
 
 $currentPublished = $null
 $mvisorOemInfs = New-Object System.Collections.Generic.List[string]
@@ -56,18 +64,18 @@ if ($mvisorOemInfs.Count -gt 0) {
         Write-Host "[INFO] Removing old mvisor_wddm packages: $($mvisorOemInfs -join ', ')"
     }
     foreach ($oemInf in $mvisorOemInfs) {
-        & pnputil /delete-driver $oemInf /uninstall /force
+        & $pnputilPath /delete-driver $oemInf /uninstall /force
     }
 } else {
     Write-Host "[INFO] No matching OEM packages found for cleanup."
 }
 
 Write-Host "[INFO] Installing new package..."
-& pnputil /add-driver $resolvedInf /install
+& $pnputilPath /add-driver $resolvedInf /install
 
 Write-Host ""
 Write-Host "[INFO] Display-class devices:"
-& pnputil /enum-devices /class Display
+& $pnputilPath /enum-devices /class Display
 
 Write-Host ""
 Write-Host "[INFO] Win32_VideoController:"

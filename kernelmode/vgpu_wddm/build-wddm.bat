@@ -12,7 +12,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo [INFO] Building mvisor_wddm (Release|x64)...
+echo [INFO] Building mvisor_wddm (Release x64)...
 msbuild mvisor_wddm.sln /t:Build /m /p:Configuration=Release /p:Platform=x64
 if errorlevel 1 (
   echo [ERROR] Build failed.
