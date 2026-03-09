@@ -2,61 +2,16 @@
  * Mvisor vGPU WDDM display-only miniport skeleton.
  *
  * This is a bring-up scaffold for a Display-class driver path (KMDOD).
- * PresentDisplayOnly/SystemDisplayWrite currently stage frames into a
- * guarded shadow framebuffer; later phases will wire host scanout.
+ * The present path is intentionally a no-op for now; later phases will
+ * wire PresentDisplayOnly/SystemDisplayWrite to virtio-vgpu scanout.
  */
 
 #include <ntddk.h>
 #include <dispmprt.h>
-#include <initguid.h>
 
 #define MVISOR_WDDM_TAG 'WvMM'
 #define MVISOR_WDDM_MAX_VIEWS 1
 #define MVISOR_WDDM_MAX_CHILDREN 1
-#define MVISOR_WDDM_VENDOR_ID 0x1AF4
-#define MVISOR_WDDM_DEVICE_ID 0x105B
-#define MVISOR_WDDM_DEFAULT_HEIGHT 768
-#define MVISOR_WDDM_MAX_SHADOW_BYTES (64 * 1024 * 1024)
-#define MVISOR_WDDM_BRIDGE_SCANOUT_ID 0
-#define MVISOR_WDDM_BRIDGE_RESOURCE_ID 1
-#define MVISOR_WDDM_BRIDGE_LOG_INTERVAL 120
-#define MVISOR_WDDM_ENABLE_BRIDGE 0
-
-/*
- * Local bridge IOCTL declarations for WDDM miniport.
- * Keep these independent from kernelmode/vgpu/ioctl.h to avoid pulling
- * linux/* headers into this standalone VS/WDK project.
- */
-// 31c22912-7210-11ed-bf22-bce92fa2e22d
-DEFINE_GUID(GUID_DEVINTERFACE_VGPU, 0x31c22912, 0x7210, 0x11ed, 0xbf, 0x22, 0xbc, 0xe9, 0x2f, 0xa2, 0xe2, 0x2d);
-
-#define IOCTL_VIRTIO_VGPU_SET_SCANOUT CTL_CODE(FILE_DEVICE_UNKNOWN, \
-    0x812, \
-    METHOD_IN_DIRECT, \
-    FILE_ANY_ACCESS)
-
-#define IOCTL_VIRTIO_VGPU_RESOURCE_FLUSH CTL_CODE(FILE_DEVICE_UNKNOWN, \
-    0x813, \
-    METHOD_IN_DIRECT, \
-    FILE_ANY_ACCESS)
-
-struct virtio_vgpu_rect {
-    ULONG x;
-    ULONG y;
-    ULONG width;
-    ULONG height;
-};
-
-struct virtio_vgpu_set_scanout {
-    ULONG scanout_id;
-    ULONG resource_id;
-    struct virtio_vgpu_rect rect;
-};
-
-struct virtio_vgpu_resource_flush {
-    ULONG resource_id;
-    struct virtio_vgpu_rect rect;
-};
 
 #ifndef DXGKDDI_WDDMv1_3
 #define DXGKDDI_WDDMv1_3 DXGKDDI_WDDMv1_2
@@ -68,26 +23,6 @@ struct virtio_vgpu_resource_flush {
 typedef struct _MVISOR_WDDM_DEVICE_CONTEXT {
     DEVICE_OBJECT* PhysicalDeviceObject;
     DXGKRNL_INTERFACE DxgkInterface;
-    USHORT VendorId;
-    USHORT DeviceId;
-    ULONG Width;
-    ULONG Height;
-    ULONG Pitch;
-    ULONG BytesPerPixel;
-    ULONG64 PresentCount;
-    ULONG64 ScanoutSeq;
-    ULONG BridgeResourceId;
-    ULONG BridgeScanoutWidth;
-    ULONG BridgeScanoutHeight;
-    ULONG64 BridgeSetScanoutCount;
-    ULONG64 BridgeFlushCount;
-    ULONG64 BridgeDropCount;
-    ULONG64 BridgeIoctlFailCount;
-    ULONG64 BridgeNoInterfaceCount;
-    HANDLE BridgeIoctlHandle;
-    PVOID ShadowFrameBuffer;
-    SIZE_T ShadowFrameBufferSize;
-    KSPIN_LOCK PresentLock;
     BOOLEAN Started;
 } MVISOR_WDDM_DEVICE_CONTEXT, *PMVISOR_WDDM_DEVICE_CONTEXT;
 
@@ -95,657 +30,6 @@ static PMVISOR_WDDM_DEVICE_CONTEXT
 MvisorWddmContextFromAdapterHandle(_In_ CONST HANDLE hAdapter)
 {
     return (PMVISOR_WDDM_DEVICE_CONTEXT)hAdapter;
-}
-
-static NTSTATUS
-MvisorWddmCheckHardware(_Inout_ PMVISOR_WDDM_DEVICE_CONTEXT context)
-{
-    NTSTATUS status;
-    ULONG bytesRead;
-    ULONG configId;
-
-    /*
-     * PCI config offset 0x00 layout:
-     * bits  0..15: Vendor ID
-     * bits 16..31: Device ID
-     */
-    status = context->DxgkInterface.DxgkCbReadDeviceSpace(
-        context->DxgkInterface.DeviceHandle,
-        DXGK_WHICHSPACE_CONFIG,
-        &configId,
-        0,
-        sizeof(configId),
-        &bytesRead);
-    if (!NT_SUCCESS(status)) {
-        /*
-         * Some bring-up environments can report transient read failures here.
-         * The INF already matches VEN/DEV, so keep StartDevice alive.
-         */
-        context->VendorId = MVISOR_WDDM_VENDOR_ID;
-        context->DeviceId = MVISOR_WDDM_DEVICE_ID;
-        MVISOR_WDDM_LOG("DxgkCbReadDeviceSpace failed status=0x%08x; continuing with INF-matched ids", status);
-        return STATUS_SUCCESS;
-    }
-    if (bytesRead < sizeof(configId)) {
-        context->VendorId = MVISOR_WDDM_VENDOR_ID;
-        context->DeviceId = MVISOR_WDDM_DEVICE_ID;
-        MVISOR_WDDM_LOG("DxgkCbReadDeviceSpace short read bytes=%lu; continuing with INF-matched ids", bytesRead);
-        return STATUS_SUCCESS;
-    }
-
-    context->VendorId = (USHORT)(configId & 0xFFFF);
-    context->DeviceId = (USHORT)((configId >> 16) & 0xFFFF);
-
-    MVISOR_WDDM_LOG("PCI id vendor=0x%04x device=0x%04x", context->VendorId, context->DeviceId);
-
-    if (context->VendorId != MVISOR_WDDM_VENDOR_ID || context->DeviceId != MVISOR_WDDM_DEVICE_ID) {
-        return STATUS_GRAPHICS_DRIVER_MISMATCH;
-    }
-
-    return STATUS_SUCCESS;
-}
-
-static ULONG
-MvisorWddmEstimateHeight(_In_ CONST DXGKARG_PRESENT_DISPLAYONLY* present)
-{
-    ULONG i;
-    ULONG maxBottom = 0;
-
-    if (present->pDirtyRect != NULL && present->NumDirtyRects > 0) {
-        for (i = 0; i < present->NumDirtyRects; i++) {
-            LONG bottom = present->pDirtyRect[i].bottom;
-            if (bottom > 0 && (ULONG)bottom > maxBottom) {
-                maxBottom = (ULONG)bottom;
-            }
-        }
-    }
-
-    if (maxBottom > 0) {
-        return maxBottom;
-    }
-    return MVISOR_WDDM_DEFAULT_HEIGHT;
-}
-
-static NTSTATUS
-MvisorWddmEnsureShadowBuffer(
-    _Inout_ PMVISOR_WDDM_DEVICE_CONTEXT context,
-    _In_ SIZE_T requiredBytes)
-{
-    KIRQL oldIrql;
-    PVOID oldBuffer;
-    PVOID newBuffer;
-
-    if (requiredBytes == 0 || requiredBytes > MVISOR_WDDM_MAX_SHADOW_BYTES) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    KeAcquireSpinLock(&context->PresentLock, &oldIrql);
-    if (context->ShadowFrameBuffer != NULL && context->ShadowFrameBufferSize >= requiredBytes) {
-        KeReleaseSpinLock(&context->PresentLock, oldIrql);
-        return STATUS_SUCCESS;
-    }
-    KeReleaseSpinLock(&context->PresentLock, oldIrql);
-
-    newBuffer = ExAllocatePoolWithTag(NonPagedPoolNx, requiredBytes, MVISOR_WDDM_TAG);
-    if (newBuffer == NULL) {
-        return STATUS_NO_MEMORY;
-    }
-
-    KeAcquireSpinLock(&context->PresentLock, &oldIrql);
-    oldBuffer = context->ShadowFrameBuffer;
-    context->ShadowFrameBuffer = newBuffer;
-    context->ShadowFrameBufferSize = requiredBytes;
-    KeReleaseSpinLock(&context->PresentLock, oldIrql);
-
-    if (oldBuffer != NULL) {
-        ExFreePoolWithTag(oldBuffer, MVISOR_WDDM_TAG);
-    }
-
-    return STATUS_SUCCESS;
-}
-
-static NTSTATUS
-MvisorWddmSafeSizeMultiply(
-    _In_ SIZE_T left,
-    _In_ SIZE_T right,
-    _Out_ SIZE_T* result)
-{
-    if (result == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if (left != 0 && right > (MAXULONG_PTR / left)) {
-        return STATUS_INTEGER_OVERFLOW;
-    }
-
-    *result = left * right;
-    return STATUS_SUCCESS;
-}
-
-static ULONG
-MvisorWddmClampRectCoord(_In_ LONG value, _In_ ULONG maxExclusive)
-{
-    if (value <= 0) {
-        return 0;
-    }
-
-    if ((ULONG)value >= maxExclusive) {
-        return maxExclusive;
-    }
-
-    return (ULONG)value;
-}
-
-static VOID
-MvisorWddmUpdateFrameStats(
-    _Inout_ PMVISOR_WDDM_DEVICE_CONTEXT context,
-    _In_ ULONG width,
-    _In_ ULONG height,
-    _In_ ULONG pitch,
-    _In_ ULONG bytesPerPixel)
-{
-    context->Pitch = pitch;
-    context->BytesPerPixel = bytesPerPixel;
-    context->Height = height;
-    context->Width = width;
-    context->PresentCount++;
-    context->ScanoutSeq++;
-}
-
-static VOID
-MvisorWddmBuildBridgeRect(
-    _In_ ULONG width,
-    _In_ ULONG height,
-    _Out_ struct virtio_vgpu_rect* rect)
-{
-    rect->x = 0;
-    rect->y = 0;
-    rect->width = width;
-    rect->height = height;
-}
-
-static NTSTATUS
-MvisorWddmAddSingleMonitorMode(
-    _In_ PMVISOR_WDDM_DEVICE_CONTEXT context,
-    _In_ CONST DXGKARG_RECOMMENDMONITORMODES* recommendMonitorModes)
-{
-    NTSTATUS status;
-    D3DKMDT_MONITOR_SOURCE_MODE* mode;
-    ULONG width;
-    ULONG height;
-
-    if (context == NULL || recommendMonitorModes == NULL ||
-        recommendMonitorModes->pMonitorSourceModeSetInterface == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    mode = NULL;
-    status = recommendMonitorModes->pMonitorSourceModeSetInterface->pfnCreateNewModeInfo(
-        recommendMonitorModes->hMonitorSourceModeSet,
-        &mode);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
-    width = (context->Width != 0) ? context->Width : 1024;
-    height = (context->Height != 0) ? context->Height : 768;
-
-    RtlZeroMemory(mode, sizeof(*mode));
-    mode->VideoSignalInfo.VideoStandard = D3DKMDT_VSS_OTHER;
-    mode->VideoSignalInfo.TotalSize.cx = width;
-    mode->VideoSignalInfo.TotalSize.cy = height;
-    mode->VideoSignalInfo.ActiveSize = mode->VideoSignalInfo.TotalSize;
-    mode->VideoSignalInfo.VSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
-    mode->VideoSignalInfo.VSyncFreq.Denominator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
-    mode->VideoSignalInfo.HSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
-    mode->VideoSignalInfo.HSyncFreq.Denominator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
-    mode->VideoSignalInfo.PixelRate = D3DKMDT_FREQUENCY_NOTSPECIFIED;
-    mode->VideoSignalInfo.ScanLineOrdering = D3DDDI_VSSLO_PROGRESSIVE;
-    mode->Origin = D3DKMDT_MCO_DRIVER;
-    mode->Preference = D3DKMDT_MP_PREFERRED;
-    mode->ColorBasis = D3DKMDT_CB_SRGB;
-    mode->ColorCoeffDynamicRanges.FirstChannel = 8;
-    mode->ColorCoeffDynamicRanges.SecondChannel = 8;
-    mode->ColorCoeffDynamicRanges.ThirdChannel = 8;
-    mode->ColorCoeffDynamicRanges.FourthChannel = 8;
-
-    status = recommendMonitorModes->pMonitorSourceModeSetInterface->pfnAddMode(
-        recommendMonitorModes->hMonitorSourceModeSet,
-        mode);
-    if (!NT_SUCCESS(status)) {
-        NTSTATUS releaseStatus;
-        releaseStatus = recommendMonitorModes->pMonitorSourceModeSetInterface->pfnReleaseModeInfo(
-            recommendMonitorModes->hMonitorSourceModeSet,
-            mode);
-        UNREFERENCED_PARAMETER(releaseStatus);
-        if (status == STATUS_GRAPHICS_MODE_ALREADY_IN_MODESET) {
-            return STATUS_SUCCESS;
-        }
-        return status;
-    }
-
-    return STATUS_SUCCESS;
-}
-
-static VOID
-MvisorWddmCloseBridgeInterface(_Inout_ PMVISOR_WDDM_DEVICE_CONTEXT context)
-{
-    HANDLE handle = context->BridgeIoctlHandle;
-    context->BridgeIoctlHandle = NULL;
-    if (handle != NULL) {
-        ZwClose(handle);
-    }
-}
-
-static NTSTATUS
-MvisorWddmEnsureBridgeInterface(
-    _Inout_ PMVISOR_WDDM_DEVICE_CONTEXT context,
-    _Out_ HANDLE* bridgeHandle)
-{
-    NTSTATUS status;
-    PWSTR interfaces;
-    UNICODE_STRING name;
-    OBJECT_ATTRIBUTES attributes;
-    IO_STATUS_BLOCK ioStatus;
-    HANDLE handle;
-
-    if (bridgeHandle == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if (context->BridgeIoctlHandle != NULL) {
-        *bridgeHandle = context->BridgeIoctlHandle;
-        return STATUS_SUCCESS;
-    }
-
-    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
-        context->BridgeNoInterfaceCount++;
-        return STATUS_INVALID_DEVICE_STATE;
-    }
-
-    interfaces = NULL;
-    status = IoGetDeviceInterfaces((LPGUID)&GUID_DEVINTERFACE_VGPU, NULL, 0, &interfaces);
-    if (!NT_SUCCESS(status)) {
-        context->BridgeNoInterfaceCount++;
-        return status;
-    }
-
-    if (interfaces == NULL || interfaces[0] == L'\0') {
-        if (interfaces != NULL) {
-            ExFreePool(interfaces);
-        }
-        context->BridgeNoInterfaceCount++;
-        return STATUS_OBJECT_NAME_NOT_FOUND;
-    }
-
-    RtlInitUnicodeString(&name, interfaces);
-    InitializeObjectAttributes(&attributes, &name, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
-    status = ZwCreateFile(
-        &handle,
-        GENERIC_READ | GENERIC_WRITE,
-        &attributes,
-        &ioStatus,
-        NULL,
-        FILE_ATTRIBUTE_NORMAL,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        FILE_OPEN,
-        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-        NULL,
-        0);
-
-    ExFreePool(interfaces);
-
-    if (!NT_SUCCESS(status)) {
-        context->BridgeNoInterfaceCount++;
-        return status;
-    }
-
-    context->BridgeIoctlHandle = handle;
-    *bridgeHandle = handle;
-    return STATUS_SUCCESS;
-}
-
-static NTSTATUS
-MvisorWddmIssueBridgeIoctl(
-    _Inout_ PMVISOR_WDDM_DEVICE_CONTEXT context,
-    _In_ ULONG ioctlCode,
-    _In_reads_bytes_(inputSize) PVOID inputBuffer,
-    _In_ ULONG inputSize)
-{
-    NTSTATUS status;
-    HANDLE handle;
-    IO_STATUS_BLOCK ioStatus;
-
-    status = MvisorWddmEnsureBridgeInterface(context, &handle);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
-    status = ZwDeviceIoControlFile(
-        handle,
-        NULL,
-        NULL,
-        NULL,
-        &ioStatus,
-        ioctlCode,
-        inputBuffer,
-        inputSize,
-        NULL,
-        0);
-    if (!NT_SUCCESS(status)) {
-        context->BridgeIoctlFailCount++;
-        if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
-            MvisorWddmCloseBridgeInterface(context);
-        }
-    }
-
-    return status;
-}
-
-static NTSTATUS
-MvisorWddmSubmitBridgePresent(
-    _Inout_ PMVISOR_WDDM_DEVICE_CONTEXT context,
-    _In_ ULONG width,
-    _In_ ULONG height)
-{
-    NTSTATUS status;
-    struct virtio_vgpu_set_scanout setScanoutCmd;
-    struct virtio_vgpu_resource_flush flushCmd;
-
-    if (width == 0 || height == 0) {
-        context->BridgeDropCount++;
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
-        context->BridgeDropCount++;
-        return STATUS_INVALID_DEVICE_STATE;
-    }
-
-    if (context->BridgeScanoutWidth != width || context->BridgeScanoutHeight != height) {
-        RtlZeroMemory(&setScanoutCmd, sizeof(setScanoutCmd));
-        setScanoutCmd.scanout_id = MVISOR_WDDM_BRIDGE_SCANOUT_ID;
-        setScanoutCmd.resource_id = context->BridgeResourceId;
-        MvisorWddmBuildBridgeRect(width, height, &setScanoutCmd.rect);
-
-        status = MvisorWddmIssueBridgeIoctl(
-            context,
-            IOCTL_VIRTIO_VGPU_SET_SCANOUT,
-            &setScanoutCmd,
-            sizeof(setScanoutCmd));
-        if (!NT_SUCCESS(status)) {
-            context->BridgeDropCount++;
-            return status;
-        }
-
-        context->BridgeScanoutWidth = width;
-        context->BridgeScanoutHeight = height;
-        context->BridgeSetScanoutCount++;
-        MVISOR_WDDM_LOG("bridge-ioctl set_scanout scanout=%lu resource=%lu rect=%lux%lu",
-            setScanoutCmd.scanout_id,
-            setScanoutCmd.resource_id,
-            setScanoutCmd.rect.width,
-            setScanoutCmd.rect.height);
-    }
-
-    RtlZeroMemory(&flushCmd, sizeof(flushCmd));
-    flushCmd.resource_id = context->BridgeResourceId;
-    MvisorWddmBuildBridgeRect(width, height, &flushCmd.rect);
-
-    status = MvisorWddmIssueBridgeIoctl(
-        context,
-        IOCTL_VIRTIO_VGPU_RESOURCE_FLUSH,
-        &flushCmd,
-        sizeof(flushCmd));
-    if (!NT_SUCCESS(status)) {
-        context->BridgeDropCount++;
-        return status;
-    }
-
-    context->BridgeFlushCount++;
-    if ((context->BridgeFlushCount % MVISOR_WDDM_BRIDGE_LOG_INTERVAL) == 0) {
-        MVISOR_WDDM_LOG("bridge-ioctl flush resource=%lu rect=%lux%lu count=%llu drops=%llu fails=%llu",
-            flushCmd.resource_id,
-            flushCmd.rect.width,
-            flushCmd.rect.height,
-            context->BridgeFlushCount,
-            context->BridgeDropCount,
-            context->BridgeIoctlFailCount);
-    }
-
-    return STATUS_SUCCESS;
-}
-
-static NTSTATUS
-MvisorWddmCopyFullFrame(
-    _In_ CONST DXGKARG_PRESENT_DISPLAYONLY* present,
-    _In_ ULONG height,
-    _In_ PUCHAR src,
-    _Inout_ PUCHAR dst)
-{
-    ULONG y;
-
-    for (y = 0; y < height; y++) {
-        SIZE_T rowOffset;
-        NTSTATUS status = MvisorWddmSafeSizeMultiply((SIZE_T)y, (SIZE_T)present->Pitch, &rowOffset);
-        if (!NT_SUCCESS(status)) {
-            return status;
-        }
-        RtlCopyMemory(dst + rowOffset, src + rowOffset, present->Pitch);
-    }
-
-    return STATUS_SUCCESS;
-}
-
-static BOOLEAN
-MvisorWddmTryCopyDirtyRect(
-    _In_ CONST DXGKARG_PRESENT_DISPLAYONLY* present,
-    _In_ ULONG width,
-    _In_ ULONG height,
-    _In_ PUCHAR src,
-    _Inout_ PUCHAR dst,
-    _In_ CONST RECT* rect)
-{
-    ULONG left;
-    ULONG right;
-    ULONG top;
-    ULONG bottom;
-    SIZE_T leftOffset;
-    SIZE_T rowBytes;
-    ULONG y;
-
-    if (rect == NULL) {
-        return FALSE;
-    }
-
-    left = MvisorWddmClampRectCoord(rect->left, width);
-    right = MvisorWddmClampRectCoord(rect->right, width);
-    top = MvisorWddmClampRectCoord(rect->top, height);
-    bottom = MvisorWddmClampRectCoord(rect->bottom, height);
-
-    if (right <= left || bottom <= top) {
-        return FALSE;
-    }
-
-    if (!NT_SUCCESS(MvisorWddmSafeSizeMultiply((SIZE_T)left, (SIZE_T)present->BytesPerPixel, &leftOffset))) {
-        return FALSE;
-    }
-    if (!NT_SUCCESS(MvisorWddmSafeSizeMultiply((SIZE_T)(right - left), (SIZE_T)present->BytesPerPixel, &rowBytes))) {
-        return FALSE;
-    }
-
-    for (y = top; y < bottom; y++) {
-        SIZE_T rowOffset;
-        if (!NT_SUCCESS(MvisorWddmSafeSizeMultiply((SIZE_T)y, (SIZE_T)present->Pitch, &rowOffset))) {
-            return FALSE;
-        }
-        RtlCopyMemory(dst + rowOffset + leftOffset, src + rowOffset + leftOffset, rowBytes);
-    }
-
-    return TRUE;
-}
-
-static NTSTATUS
-MvisorWddmStageSystemDisplayFrame(
-    _Inout_ PMVISOR_WDDM_DEVICE_CONTEXT context,
-    _In_ CONST VOID* source,
-    _In_ UINT sourceWidth,
-    _In_ UINT sourceHeight,
-    _In_ UINT sourceStride)
-{
-    NTSTATUS status;
-    SIZE_T requiredBytes;
-    UINT y;
-    CONST PUCHAR src = (CONST PUCHAR)source;
-    PUCHAR dst;
-    KIRQL oldIrql;
-
-    if (source == NULL || sourceWidth == 0 || sourceHeight == 0 || sourceStride == 0) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    status = MvisorWddmSafeSizeMultiply((SIZE_T)sourceStride, (SIZE_T)sourceHeight, &requiredBytes);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-    if (requiredBytes == 0 || requiredBytes > MVISOR_WDDM_MAX_SHADOW_BYTES) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    status = MvisorWddmEnsureShadowBuffer(context, requiredBytes);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
-    KeAcquireSpinLock(&context->PresentLock, &oldIrql);
-    dst = (PUCHAR)context->ShadowFrameBuffer;
-    if (dst == NULL || context->ShadowFrameBufferSize < requiredBytes) {
-        KeReleaseSpinLock(&context->PresentLock, oldIrql);
-        return STATUS_UNSUCCESSFUL;
-    }
-
-    for (y = 0; y < sourceHeight; y++) {
-        SIZE_T rowOffset;
-        status = MvisorWddmSafeSizeMultiply((SIZE_T)y, (SIZE_T)sourceStride, &rowOffset);
-        if (!NT_SUCCESS(status)) {
-            KeReleaseSpinLock(&context->PresentLock, oldIrql);
-            return status;
-        }
-        RtlCopyMemory(dst + rowOffset, src + rowOffset, sourceStride);
-    }
-
-    MvisorWddmUpdateFrameStats(context, sourceWidth, sourceHeight, sourceStride, 4);
-    KeReleaseSpinLock(&context->PresentLock, oldIrql);
-
-#if MVISOR_WDDM_ENABLE_BRIDGE
-    status = MvisorWddmSubmitBridgePresent(context, sourceWidth, sourceHeight);
-    if (!NT_SUCCESS(status) && ((context->BridgeDropCount % MVISOR_WDDM_BRIDGE_LOG_INTERVAL) == 0)) {
-        MVISOR_WDDM_LOG("bridge submit failed in SystemDisplayWrite status=0x%08x drops=%llu",
-            status,
-            context->BridgeDropCount);
-    }
-#endif
-
-    return STATUS_SUCCESS;
-}
-
-static NTSTATUS
-MvisorWddmStagePresentFrame(
-    _Inout_ PMVISOR_WDDM_DEVICE_CONTEXT context,
-    _In_ CONST DXGKARG_PRESENT_DISPLAYONLY* present)
-{
-    NTSTATUS status;
-    SIZE_T requiredBytes;
-    ULONG width;
-    ULONG height;
-    ULONG i;
-    ULONG dirtyCopied;
-    PUCHAR src;
-    PUCHAR dst;
-    KIRQL oldIrql;
-
-    if (present->pSource == NULL || present->Pitch == 0 || present->BytesPerPixel == 0) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if ((present->Pitch % present->BytesPerPixel) != 0) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    width = present->Pitch / present->BytesPerPixel;
-    if (width == 0) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    height = MvisorWddmEstimateHeight(present);
-    status = MvisorWddmSafeSizeMultiply((SIZE_T)present->Pitch, (SIZE_T)height, &requiredBytes);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-    if (requiredBytes == 0 || requiredBytes > MVISOR_WDDM_MAX_SHADOW_BYTES) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    status = MvisorWddmEnsureShadowBuffer(context, requiredBytes);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
-    src = (PUCHAR)present->pSource;
-
-    KeAcquireSpinLock(&context->PresentLock, &oldIrql);
-    dst = (PUCHAR)context->ShadowFrameBuffer;
-    if (dst == NULL || context->ShadowFrameBufferSize < requiredBytes) {
-        KeReleaseSpinLock(&context->PresentLock, oldIrql);
-        return STATUS_UNSUCCESSFUL;
-    }
-
-    dirtyCopied = 0;
-    if (present->pDirtyRect != NULL && present->NumDirtyRects > 0) {
-        for (i = 0; i < present->NumDirtyRects; i++) {
-            if (MvisorWddmTryCopyDirtyRect(
-                    present,
-                    width,
-                    height,
-                    src,
-                    dst,
-                    &present->pDirtyRect[i])) {
-                dirtyCopied++;
-            }
-        }
-    }
-
-    if (dirtyCopied == 0) {
-        status = MvisorWddmCopyFullFrame(present, height, src, dst);
-        if (!NT_SUCCESS(status)) {
-            KeReleaseSpinLock(&context->PresentLock, oldIrql);
-            return status;
-        }
-    }
-
-    MvisorWddmUpdateFrameStats(context, width, height, present->Pitch, present->BytesPerPixel);
-
-    if ((context->PresentCount % 120) == 0) {
-        MVISOR_WDDM_LOG("present-staged frames=%llu size=%lux%lu pitch=%lu dirty=%lu/%u",
-            context->PresentCount,
-            context->Width,
-            context->Height,
-            context->Pitch,
-            dirtyCopied,
-            present->NumDirtyRects);
-    }
-
-    KeReleaseSpinLock(&context->PresentLock, oldIrql);
-
-#if MVISOR_WDDM_ENABLE_BRIDGE
-    status = MvisorWddmSubmitBridgePresent(context, width, height);
-    if (!NT_SUCCESS(status) && ((context->BridgeDropCount % MVISOR_WDDM_BRIDGE_LOG_INTERVAL) == 0)) {
-        MVISOR_WDDM_LOG("bridge submit failed in PresentDisplayOnly status=0x%08x drops=%llu",
-            status,
-            context->BridgeDropCount);
-    }
-#endif
-
-    return STATUS_SUCCESS;
 }
 
 VOID
@@ -779,8 +63,6 @@ MvisorWddmAddDevice(
 
     RtlZeroMemory(context, sizeof(*context));
     context->PhysicalDeviceObject = PhysicalDeviceObject;
-    context->BridgeResourceId = MVISOR_WDDM_BRIDGE_RESOURCE_ID;
-    KeInitializeSpinLock(&context->PresentLock);
     context->Started = FALSE;
     *MiniportDeviceContext = context;
 
@@ -796,12 +78,6 @@ MvisorWddmRemoveDevice(_In_ VOID* MiniportDeviceContext)
 
     context = (PMVISOR_WDDM_DEVICE_CONTEXT)MiniportDeviceContext;
     if (context != NULL) {
-        MvisorWddmCloseBridgeInterface(context);
-        if (context->ShadowFrameBuffer != NULL) {
-            ExFreePoolWithTag(context->ShadowFrameBuffer, MVISOR_WDDM_TAG);
-            context->ShadowFrameBuffer = NULL;
-            context->ShadowFrameBufferSize = 0;
-        }
         ExFreePoolWithTag(context, MVISOR_WDDM_TAG);
     }
 
@@ -816,7 +92,6 @@ MvisorWddmStartDevice(
     _Out_ ULONG* NumberOfViews,
     _Out_ ULONG* NumberOfChildren)
 {
-    NTSTATUS status;
     PMVISOR_WDDM_DEVICE_CONTEXT context;
 
     UNREFERENCED_PARAMETER(DxgkStartInfo);
@@ -830,28 +105,10 @@ MvisorWddmStartDevice(
     context = (PMVISOR_WDDM_DEVICE_CONTEXT)MiniportDeviceContext;
     RtlCopyMemory(&context->DxgkInterface, DxgkInterface, sizeof(*DxgkInterface));
 
-    status = MvisorWddmCheckHardware(context);
-    if (!NT_SUCCESS(status)) {
-        MVISOR_WDDM_LOG("hardware check failed status=0x%08x", status);
-        return status;
-    }
-
     *NumberOfViews = MVISOR_WDDM_MAX_VIEWS;
     *NumberOfChildren = MVISOR_WDDM_MAX_CHILDREN;
 
     context->Started = TRUE;
-
-#if MVISOR_WDDM_ENABLE_BRIDGE
-    status = MvisorWddmEnsureBridgeInterface(context, &context->BridgeIoctlHandle);
-    if (NT_SUCCESS(status)) {
-        MVISOR_WDDM_LOG("%s", "bridge interface connected");
-    } else {
-        MVISOR_WDDM_LOG("bridge interface unavailable status=0x%08x", status);
-    }
-#else
-    MVISOR_WDDM_LOG("%s", "bridge interface disabled for startup isolation");
-#endif
-
     MVISOR_WDDM_LOG("StartDevice views=%lu children=%lu", *NumberOfViews, *NumberOfChildren);
 
     return STATUS_SUCCESS;
@@ -870,11 +127,6 @@ MvisorWddmStopDevice(_In_ VOID* MiniportDeviceContext)
 
     context = (PMVISOR_WDDM_DEVICE_CONTEXT)MiniportDeviceContext;
     context->Started = FALSE;
-    context->Width = 0;
-    context->Height = 0;
-    context->Pitch = 0;
-    context->BytesPerPixel = 0;
-    MvisorWddmCloseBridgeInterface(context);
 
     return STATUS_SUCCESS;
 }
@@ -926,9 +178,6 @@ MvisorWddmQueryChildRelations(
 
     RtlZeroMemory(ChildRelations, ChildRelationsSize);
 
-    /*
-     * DXGK expects the last descriptor entry to remain zeroed as a terminator.
-     */
     childCount = (ChildRelationsSize / sizeof(DXGK_CHILD_DESCRIPTOR));
     if (childCount > 1) {
         childCount -= 1;
@@ -955,6 +204,8 @@ MvisorWddmQueryChildStatus(
     _Inout_ DXGK_CHILD_STATUS* ChildStatus,
     _In_ BOOLEAN NonDestructiveOnly)
 {
+    PMVISOR_WDDM_DEVICE_CONTEXT context;
+
     UNREFERENCED_PARAMETER(NonDestructiveOnly);
     PAGED_CODE();
 
@@ -962,9 +213,11 @@ MvisorWddmQueryChildStatus(
         return STATUS_INVALID_PARAMETER;
     }
 
+    context = (PMVISOR_WDDM_DEVICE_CONTEXT)MiniportDeviceContext;
+
     switch (ChildStatus->Type) {
     case StatusConnection:
-        ChildStatus->HotPlug.Connected = TRUE;
+        ChildStatus->HotPlug.Connected = context->Started ? TRUE : FALSE;
         return STATUS_SUCCESS;
     case StatusRotation:
         return STATUS_INVALID_PARAMETER;
@@ -1032,7 +285,7 @@ MvisorWddmQueryAdapterInfo(
 
         driverCaps = (DXGK_DRIVERCAPS*)QueryAdapterInfo->pOutputData;
         RtlZeroMemory(driverCaps, sizeof(*driverCaps));
-        driverCaps->WDDMVersion = DXGKDDI_WDDMv1_2;
+        driverCaps->WDDMVersion = DXGKDDI_WDDMv1_3;
         driverCaps->HighestAcceptableAddress.QuadPart = -1;
         driverCaps->SupportNonVGA = TRUE;
         driverCaps->SupportSmoothRotation = TRUE;
@@ -1078,7 +331,7 @@ MvisorWddmSetPointerPosition(
         return STATUS_SUCCESS;
     }
 
-    return STATUS_UNSUCCESSFUL;
+    return STATUS_NOT_SUPPORTED;
 }
 
 NTSTATUS
@@ -1111,15 +364,13 @@ MvisorWddmPresentDisplayOnly(
         return STATUS_UNSUCCESSFUL;
     }
 
-    if (PresentDisplayOnly->BytesPerPixel < 4) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
     /*
-     * Phase-4 step: ingest and stage presents in a shadow buffer with
-     * geometry/dirty-rect tracking. Host scanout transport wiring is next.
+     * TODO: Phase 4+ integration point:
+     * - map VidPnSourceId/source surface into virtio-vgpu resource
+     * - issue host present/scanout update
+     * - signal fence completion path for DWM pacing
      */
-    return MvisorWddmStagePresentFrame(context, PresentDisplayOnly);
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS
@@ -1146,59 +397,12 @@ MvisorWddmIsSupportedVidPn(
     _In_ CONST HANDLE hAdapter,
     _Inout_ DXGKARG_ISSUPPORTEDVIDPN* IsSupportedVidPn)
 {
-    NTSTATUS status;
-    PMVISOR_WDDM_DEVICE_CONTEXT context;
-    CONST DXGK_VIDPN_INTERFACE* vidPnInterface;
-    D3DKMDT_HVIDPNTOPOLOGY topologyHandle;
-    CONST DXGK_VIDPNTOPOLOGY_INTERFACE* topologyInterface;
-    D3DDDI_VIDEO_PRESENT_SOURCE_ID sourceId;
+    UNREFERENCED_PARAMETER(hAdapter);
 
     PAGED_CODE();
 
-    if (hAdapter == NULL || IsSupportedVidPn == NULL) {
+    if (IsSupportedVidPn == NULL) {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    context = MvisorWddmContextFromAdapterHandle(hAdapter);
-
-    if (IsSupportedVidPn->hDesiredVidPn == 0) {
-        IsSupportedVidPn->IsVidPnSupported = TRUE;
-        return STATUS_SUCCESS;
-    }
-
-    IsSupportedVidPn->IsVidPnSupported = FALSE;
-
-    status = context->DxgkInterface.DxgkCbQueryVidPnInterface(
-        IsSupportedVidPn->hDesiredVidPn,
-        DXGK_VIDPN_INTERFACE_VERSION_V1,
-        &vidPnInterface);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
-    status = vidPnInterface->pfnGetTopology(
-        IsSupportedVidPn->hDesiredVidPn,
-        &topologyHandle,
-        &topologyInterface);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
-    for (sourceId = 0; sourceId < MVISOR_WDDM_MAX_VIEWS; sourceId++) {
-        SIZE_T pathCount = 0;
-        status = topologyInterface->pfnGetNumPathsFromSource(
-            topologyHandle,
-            sourceId,
-            &pathCount);
-        if (status == STATUS_GRAPHICS_SOURCE_NOT_IN_TOPOLOGY) {
-            continue;
-        }
-        if (!NT_SUCCESS(status)) {
-            return status;
-        }
-        if (pathCount > MVISOR_WDDM_MAX_CHILDREN) {
-            return STATUS_SUCCESS;
-        }
     }
 
     IsSupportedVidPn->IsVidPnSupported = TRUE;
@@ -1215,7 +419,7 @@ MvisorWddmRecommendFunctionalVidPn(
     UNREFERENCED_PARAMETER(RecommendFunctionalVidPn);
     PAGED_CODE();
 
-    return STATUS_GRAPHICS_NO_RECOMMENDED_FUNCTIONAL_VIDPN;
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS
@@ -1276,16 +480,11 @@ MvisorWddmRecommendMonitorModes(
     _In_ CONST HANDLE hAdapter,
     _In_ CONST DXGKARG_RECOMMENDMONITORMODES* CONST RecommendMonitorModes)
 {
-    PMVISOR_WDDM_DEVICE_CONTEXT context;
-
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(RecommendMonitorModes);
     PAGED_CODE();
 
-    if (hAdapter == NULL || RecommendMonitorModes == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    context = MvisorWddmContextFromAdapterHandle(hAdapter);
-    return MvisorWddmAddSingleMonitorMode(context, RecommendMonitorModes);
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS
@@ -1342,26 +541,13 @@ MvisorWddmSystemDisplayWrite(
     _In_ UINT PositionX,
     _In_ UINT PositionY)
 {
-    PMVISOR_WDDM_DEVICE_CONTEXT context;
-    NTSTATUS status;
-
+    UNREFERENCED_PARAMETER(MiniportDeviceContext);
+    UNREFERENCED_PARAMETER(Source);
+    UNREFERENCED_PARAMETER(SourceWidth);
+    UNREFERENCED_PARAMETER(SourceHeight);
+    UNREFERENCED_PARAMETER(SourceStride);
     UNREFERENCED_PARAMETER(PositionX);
     UNREFERENCED_PARAMETER(PositionY);
-
-    if (MiniportDeviceContext == NULL || Source == NULL) {
-        return;
-    }
-
-    context = (PMVISOR_WDDM_DEVICE_CONTEXT)MiniportDeviceContext;
-    status = MvisorWddmStageSystemDisplayFrame(
-        context,
-        Source,
-        SourceWidth,
-        SourceHeight,
-        SourceStride);
-    if (!NT_SUCCESS(status)) {
-        MVISOR_WDDM_LOG("SystemDisplayWrite stage failed status=0x%08x", status);
-    }
 }
 
 NTSTATUS
