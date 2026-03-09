@@ -20,6 +20,7 @@
 #define MVISOR_WDDM_BRIDGE_SCANOUT_ID 0
 #define MVISOR_WDDM_BRIDGE_RESOURCE_ID 1
 #define MVISOR_WDDM_BRIDGE_LOG_INTERVAL 120
+#define MVISOR_WDDM_ENABLE_BRIDGE 0
 
 /*
  * Local bridge IOCTL declarations for WDDM miniport.
@@ -573,12 +574,14 @@ MvisorWddmStageSystemDisplayFrame(
     MvisorWddmUpdateFrameStats(context, sourceWidth, sourceHeight, sourceStride, 4);
     KeReleaseSpinLock(&context->PresentLock, oldIrql);
 
+#if MVISOR_WDDM_ENABLE_BRIDGE
     status = MvisorWddmSubmitBridgePresent(context, sourceWidth, sourceHeight);
     if (!NT_SUCCESS(status) && ((context->BridgeDropCount % MVISOR_WDDM_BRIDGE_LOG_INTERVAL) == 0)) {
         MVISOR_WDDM_LOG("bridge submit failed in SystemDisplayWrite status=0x%08x drops=%llu",
             status,
             context->BridgeDropCount);
     }
+#endif
 
     return STATUS_SUCCESS;
 }
@@ -670,12 +673,14 @@ MvisorWddmStagePresentFrame(
 
     KeReleaseSpinLock(&context->PresentLock, oldIrql);
 
+#if MVISOR_WDDM_ENABLE_BRIDGE
     status = MvisorWddmSubmitBridgePresent(context, width, height);
     if (!NT_SUCCESS(status) && ((context->BridgeDropCount % MVISOR_WDDM_BRIDGE_LOG_INTERVAL) == 0)) {
         MVISOR_WDDM_LOG("bridge submit failed in PresentDisplayOnly status=0x%08x drops=%llu",
             status,
             context->BridgeDropCount);
     }
+#endif
 
     return STATUS_SUCCESS;
 }
@@ -773,12 +778,16 @@ MvisorWddmStartDevice(
 
     context->Started = TRUE;
 
+#if MVISOR_WDDM_ENABLE_BRIDGE
     status = MvisorWddmEnsureBridgeInterface(context, &context->BridgeIoctlHandle);
     if (NT_SUCCESS(status)) {
         MVISOR_WDDM_LOG("%s", "bridge interface connected");
     } else {
         MVISOR_WDDM_LOG("bridge interface unavailable status=0x%08x", status);
     }
+#else
+    MVISOR_WDDM_LOG("%s", "bridge interface disabled for startup isolation");
+#endif
 
     MVISOR_WDDM_LOG("StartDevice views=%lu children=%lu", *NumberOfViews, *NumberOfChildren);
 
